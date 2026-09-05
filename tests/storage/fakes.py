@@ -117,12 +117,23 @@ class FakeMongoRepository:
         if remote_etag is not None:
             doc["remote_etag"] = remote_etag
 
-    def mark_failed(self, doc_id: str, *, stage: str, reason: str, now: str) -> None:
+    def mark_failed(
+        self,
+        doc_id: str,
+        *,
+        stage: str,
+        reason: str,
+        now: str,
+        candidate_errors: list[dict] | None = None,
+    ) -> None:
         self.mark_failed_calls += 1
         doc = self.docs[doc_id]
+        error: dict = {"stage": stage, "reason": reason, "occurred_at": now}
+        if candidate_errors:
+            error["candidate_errors"] = candidate_errors
         doc.update(
             status="failed",
-            error={"stage": stage, "reason": reason, "occurred_at": now},
+            error=error,
             last_checked_at=now,
         )
 

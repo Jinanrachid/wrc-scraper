@@ -312,19 +312,38 @@ class WrcSpider(scrapy.Spider):
             # while the Request/response URL percent-encodes it (%20), so two
             # independently computed "detail_url"s would silently never match
             # and the record would misfire as a dangling failure on success.
-            detail_request = response.follow(
-                detail_href,
-                callback=self.parse_detail,
-                errback=self._detail_failed,
-                cb_kwargs={
-                    "body": body,
-                    "partition": partition,
-                    "identifier": identifier.strip(),
-                    "published_date_raw": (decision_date_raw or "").strip(),
-                    "description": (description or "").strip(),
-                },
-            )
-            self._mark_pending(body, partition, detail_request.url, identifier.strip())
+            # Catch-all for any unexpected surprise while *constructing* the
+            # detail request (e.g. a novel selector shape on a single row).
+            # Without this, one bad row would abort the whole generator --
+            # taking the remaining rows on this page *and* the pagination
+            # continuation down with it. Isolate the failure to this row,
+            # log it via the existing helper, and move on. Only construction
+            # is guarded; `yield detail_request` stays outside so nothing
+            # interferes with generator/`yield` control flow. The two explicit
+            # checks above `continue` before reaching here, so their specific
+            # reason strings are unaffected.
+            try:
+                detail_request = response.follow(
+                    detail_href,
+                    callback=self.parse_detail,
+                    errback=self._detail_failed,
+                    cb_kwargs={
+                        "body": body,
+                        "partition": partition,
+                        "identifier": identifier.strip(),
+                        "published_date_raw": (decision_date_raw or "").strip(),
+                        "description": (description or "").strip(),
+                    },
+                )
+                self._mark_pending(body, partition, detail_request.url, identifier.strip())
+            except Exception as exc:  # noqa: BLE001 -- isolate one row, keep the page going
+                self._record_immediate_failure(
+                    body,
+                    partition,
+                    reason=repr(exc),
+                    listing_url=response.url,
+                )
+                continue
             yield detail_request
 
         if rows:
@@ -462,6 +481,25 @@ class WrcSpider(scrapy.Spider):
                 url=response.url,
                 etag=response.request.meta.get("conditional_etag"),
             )
+
+        # A non-304 response with a zero-length body is not a successful fetch:
+        # storing it would create a "successfully scraped" 0-byte document that
+        # looks fine in the stats but is useless downstream. Fail it explicitly
+        # (a clearly logged failure beats a silently-worse outcome) rather than
+        # letting an empty `raw_binary` flow through as if it were real content.
+        # 304s legitimately carry no body and are handled above, so they're
+        # excluded from this check.
+        if not not_modified and len(response.body) == 0:
+            self._record_failed(
+                body,
+                partition,
+                detail_url=detail_url,
+                reason=f"empty response body for {document_type} document",
+                url=response.url,
+                http_status=response.status,
+            )
+            self._maybe_complete_partition(body, partition)
+            return
 
         record = WrcDecisionRecord(
             identifier=identifier,

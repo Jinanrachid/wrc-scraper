@@ -112,6 +112,12 @@ class PartitionSettings:
 DEFAULT_SEARCH_URL = "https://www.workplacerelations.ie/en/search/"
 DEFAULT_USER_AGENT = "wrc_scraper (Kedra coding assessment; contact: jinanrachid@gmail.com)"
 DEFAULT_RETRY_HTTP_CODES = [429, 500, 502, 503, 504, 408, 522, 524]
+# Pin the reactor explicitly instead of inheriting Scrapy's version-dependent
+# default. This is the asyncio-backed Twisted reactor (Scrapy's own default since
+# 2.7 and on the installed 2.18), locked here so an unattended production run
+# behaves identically regardless of the Scrapy version present -- and so any
+# async/await usage in spiders/middleware keeps a supported event loop.
+DEFAULT_TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,6 +127,8 @@ class ScrapingSettings:
     allowed_domains: list[str]
     user_agent: str
     robotstxt_obey: bool
+    # event loop / reactor (pinned; see DEFAULT_TWISTED_REACTOR)
+    twisted_reactor: str
     # concurrency / throttle. Ramp in docs/SCRAPY_EXPERIMENTS.md Sec 15 found 24
     # optimal under good latency; the default was revised down to 16 with a 60s
     # timeout (Sec 21) after a live run showed 24/30 producing timeout noise when
@@ -159,6 +167,7 @@ class ScrapingSettings:
             allowed_domains=allowed_domains,
             user_agent=env_str("WRC_USER_AGENT", DEFAULT_USER_AGENT),
             robotstxt_obey=env_bool("WRC_ROBOTSTXT_OBEY", False),
+            twisted_reactor=env_str("WRC_TWISTED_REACTOR", DEFAULT_TWISTED_REACTOR),
             concurrent_requests=concurrent_requests,
             # Single-domain crawl: default the per-domain cap equal to the global
             # one, else Scrapy's default (8) would silently bind below it.

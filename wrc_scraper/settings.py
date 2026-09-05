@@ -20,6 +20,13 @@ NEWSPIDER_MODULE = "wrc_scraper.spiders"
 
 ADDONS = {}
 
+# Pin the event-loop reactor explicitly rather than inheriting Scrapy's
+# version-dependent default. Defaults to the asyncio-backed Twisted reactor
+# (AsyncioSelectorReactor); overridable via WRC_TWISTED_REACTOR. Locking this
+# keeps an unattended production run deterministic across Scrapy upgrades and
+# guarantees a supported loop for any async/await in spiders or middleware.
+TWISTED_REACTOR = _cfg.twisted_reactor
+
 # Identify the crawler honestly (docs/SCRAPY_EXPERIMENTS.md robots.txt section).
 USER_AGENT = _cfg.user_agent
 

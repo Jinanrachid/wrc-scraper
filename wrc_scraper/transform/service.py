@@ -88,7 +88,15 @@ class DestMongoPort(Protocol):
         extra: dict[str, object] | None = None,
     ) -> None: ...
     def mark_unchanged(self, doc_id: str, *, remote_etag: str | None, now: str) -> None: ...
-    def mark_failed(self, doc_id: str, *, stage: str, reason: str, now: str) -> None: ...
+    def mark_failed(
+        self,
+        doc_id: str,
+        *,
+        stage: str,
+        reason: str,
+        now: str,
+        candidate_errors: list[dict] | None = None,
+    ) -> None: ...
 
 
 class DestMinioPort(Protocol):
@@ -279,14 +287,18 @@ class TransformService:
                 )
             return "skipped", dropped
 
-        resolved, unresolved_count = self._resolve_candidates(doc_id, candidates)
+        resolved, unresolved_count, candidate_errors = self._resolve_candidates(doc_id, candidates)
         if not resolved:
             # upsert_pending first: mark_failed only updates an existing doc, and
             # every candidate having failed to resolve means no other branch has
             # created one yet this run.
             self._dest_mongo.upsert_pending(doc_id, now=now, **self._metadata_fields(candidates[0]))
             self._dest_mongo.mark_failed(
-                doc_id, stage="transform", reason="no viable candidate in cluster", now=now
+                doc_id,
+                stage="transform",
+                reason="no viable candidate in cluster",
+                now=now,
+                candidate_errors=candidate_errors or None,
             )
             self._log("record_failed", doc_id=doc_id, reason="no viable candidate in cluster")
             return "failed", 0
@@ -380,9 +392,17 @@ class TransformService:
 
     def _resolve_candidates(
         self, doc_id: str, candidates: list[dict]
-    ) -> tuple[list[_Resolved], int]:
+    ) -> tuple[list[_Resolved], int, list[dict]]:
+        """Resolve candidates into `_Resolved` objects.
+
+        Returns ``(resolved, unresolved_count, candidate_errors)`` where
+        ``candidate_errors`` is a list of ``{detail_url, reason}`` dicts for
+        every candidate that could not be resolved -- so callers can surface
+        the root cause in Mongo rather than only the aggregate outcome.
+        """
         resolved: list[_Resolved] = []
         unresolved_count = 0
+        candidate_errors: list[dict] = []
         for candidate in candidates:
             detail_url = candidate.get("detail_url")
             document_type = candidate.get("document_type")
@@ -392,12 +412,14 @@ class TransformService:
                 # passthrough binary -- explicit rejection (assessment: a new
                 # file format must not be silently corrupted or mistreated).
                 unresolved_count += 1
+                reason = f"unsupported document_type {document_type!r}"
                 self._log(
                     "variant_dropped",
                     doc_id=doc_id,
                     detail_url=detail_url,
-                    reason=f"unsupported document_type {document_type!r}",
+                    reason=reason,
                 )
+                candidate_errors.append({"detail_url": detail_url, "reason": reason})
                 continue
 
             try:
@@ -406,12 +428,14 @@ class TransformService:
                 # one candidate, not the whole cluster; the remaining candidates are
                 # still eligible to become canonical.
                 unresolved_count += 1
+                reason = f"source fetch failed: {exc!r}"
                 self._log(
                     "variant_dropped",
                     doc_id=doc_id,
                     detail_url=detail_url,
-                    reason=f"source fetch failed: {exc!r}",
+                    reason=reason,
                 )
+                candidate_errors.append({"detail_url": detail_url, "reason": reason})
                 continue
 
             if document_type == "html_inline":
@@ -423,21 +447,25 @@ class TransformService:
                     # this one candidate (e.g. a page served with a non-UTF-8 encoding);
                     # siblings in the cluster are still eligible to become canonical.
                     unresolved_count += 1
+                    reason = f"decode/clean failed: {exc!r}"
                     self._log(
                         "variant_dropped",
                         doc_id=doc_id,
                         detail_url=detail_url,
-                        reason=f"decode/clean failed: {exc!r}",
+                        reason=reason,
                     )
+                    candidate_errors.append({"detail_url": detail_url, "reason": reason})
                     continue
                 if cleaned is None:
                     unresolved_count += 1
+                    reason = "empty or missing div.content"
                     self._log(
                         "variant_dropped",
                         doc_id=doc_id,
                         detail_url=detail_url,
-                        reason="empty or missing div.content",
+                        reason=reason,
                     )
+                    candidate_errors.append({"detail_url": detail_url, "reason": reason})
                     continue
                 resolved.append(
                     _Resolved(
@@ -446,7 +474,7 @@ class TransformService:
                 )
             else:
                 resolved.append(_Resolved(candidate, data, len(data), False))
-        return resolved, unresolved_count
+        return resolved, unresolved_count, candidate_errors
 
     @staticmethod
     def _metadata_fields(candidate: dict) -> dict[str, object]:
