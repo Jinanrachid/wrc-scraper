@@ -107,11 +107,14 @@ def sanitize_identifier(identifier: str) -> str:
     """Filename-safe form of `identifier` (h2.title), for the transformation
     stage's `identifier.ext` renaming.
 
-    Handles exactly the unsafe patterns actually observed across ~375 sampled
-    rows -- `/` (RP74/2007), `,` and spaces (compound multi-complaint titles),
-    and the spaced form "IR - SC - 00000787". Anything else raises rather than
-    being silently dropped or guessed at: this sanitizes what we have evidence
-    for, it is not a blanket "make any string safe" helper.
+    Handles all unsafe patterns observed in live data across all four bodies:
+    - `/`             RP74/2007 -- replaced with `-`
+    - `,`             compound multi-complaint titles -- stripped
+    - `&`             compound case titles (ADJ-00045266 & ADJ-00047456) -- stripped
+    - en-dash `–`     variant of ` - ` used in IR-SC identifiers -- normalised to `-`
+    - spaces          replaced with `_`, then consecutive separators collapsed
+    - any other char  raises -- this sanitizes what we have evidence for; it is
+                      not a blanket "make any string safe" helper.
 
     Not used for identity -- `identifier` is not part of the key, and this
     slug collides wherever the raw identifier collides, which is expected.
@@ -119,9 +122,16 @@ def sanitize_identifier(identifier: str) -> str:
     if not identifier or not identifier.strip():
         raise ValueError("identifier must not be empty")
 
-    slug = identifier.strip().replace("/", "-").replace(",", "")
+    slug = identifier.strip()
+    # Normalise unicode dashes/hyphens to ASCII hyphen before further processing
+    slug = slug.replace("\u2013", "-").replace("\u2014", "-")  # en-dash, em-dash
+    slug = slug.replace("/", "-").replace(",", "").replace("&", "")
     slug = re.sub(r"\s+", "_", slug)
     slug = re.sub(r"[-_]{2,}", lambda match: match.group(0)[0], slug)
+    slug = slug.strip("-_")  # remove leading/trailing separators left by stripping chars
+
+    if not slug:
+        raise ValueError(f"identifier {identifier!r} reduced to empty string after sanitization")
 
     if _UNSAFE_SLUG_CHARS.search(slug):
         raise ValueError(
