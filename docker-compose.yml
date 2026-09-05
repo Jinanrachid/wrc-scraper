@@ -1,0 +1,45 @@
+# Local MongoDB + MinIO for development/testing.
+#
+# All credentials and ports are read from the environment (Compose auto-loads a
+# `.env` file in this directory) with sensible defaults, so infra and the app
+# share a single source of truth -- no hardcoded values. The same WRC_MINIO_*
+# credentials configured here are what the pipeline uses to connect (see
+# wrc_scraper/config.py and .env.example).
+services:
+  mongo:
+    image: ${WRC_MONGO_IMAGE:-mongo:7}
+    ports:
+      - "${WRC_MONGO_PORT:-27017}:27017"
+    volumes:
+      - wrc_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    # Pinned to a specific release for reproducibility (not :latest). This is the
+    # official recommended healthcheck: `mc` ships in the image and `curl` was
+    # removed, so mc-ready is the correct probe (minio/minio issue #18389).
+    image: ${WRC_MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${WRC_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${WRC_MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "${WRC_MINIO_PORT:-9000}:9000"
+      - "${WRC_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - wrc_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  wrc_mongo_data:
+  wrc_minio_data:

@@ -1,0 +1,31 @@
+[project]
+name = "wrc-scraper"
+version = "0.1.0"
+description = "Scrapy pipeline for Workplace Relations (WRC) decisions and metadata"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "scrapy>=2.18,<3",
+    "pymongo>=4.18,<5",
+    "minio>=7.2,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.16,<1",
+    "pytest>=9,<10",
+    "mongomock>=4.1,<5",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
