@@ -60,6 +60,15 @@ def mongo_document_id(body_slug: str, detail_url: str) -> str:
     return f"{body_slug}:{detail_url_path(detail_url)}"
 
 
+def _extension_for(document_type: str) -> str:
+    """The stored artifact's file extension for a given `document_type`.
+
+    `html_inline` stores as `.html`; every other document_type ("pdf", "doc",
+    "docx") is already a valid extension as-is.
+    """
+    return "html" if document_type == "html_inline" else document_type
+
+
 def minio_object_key(body_slug: str, detail_url: str, document_type: str) -> str:
     """`{body slug}/{url path stem}.{ext}`.
 
@@ -69,8 +78,29 @@ def minio_object_key(body_slug: str, detail_url: str, document_type: str) -> str
     must end `.pdf`.
     """
     path = PurePosixPath(detail_url_path(detail_url))
-    extension = "html" if document_type == "html_inline" else document_type
-    return f"{body_slug}/{path.with_suffix('')}.{extension}"
+    return f"{body_slug}/{path.with_suffix('')}.{_extension_for(document_type)}"
+
+
+def transformed_mongo_document_id(body_slug: str, identifier: str) -> str:
+    """`{body slug}:{sanitized identifier}` -- the Phase 4 transformed-store key.
+
+    Unlike the landing key (`mongo_document_id`, keyed on `detail_url`), the
+    transformed store is keyed on `identifier`: several landing `detail_url`s can
+    legitimately share one `identifier` (variant clusters, docs/SCRAPY_EXPERIMENTS.md
+    Sec 19), and the transformation stage picks exactly one canonical copy per
+    `(body_slug, identifier)` group to rename to `identifier.ext` -- so that pair
+    must be the transformed store's identity, not `detail_url`.
+    """
+    return f"{body_slug}:{sanitize_identifier(identifier)}"
+
+
+def transformed_minio_object_key(body_slug: str, identifier: str, document_type: str) -> str:
+    """`{body slug}/{sanitized identifier}.{ext}` -- the assessment's
+    `identifier.ext` renaming requirement, with the body_slug prefix kept
+    (matches the landing layout) so the bucket stays browsable and identifiers
+    can't collide across bodies.
+    """
+    return f"{body_slug}/{sanitize_identifier(identifier)}.{_extension_for(document_type)}"
 
 
 def sanitize_identifier(identifier: str) -> str:

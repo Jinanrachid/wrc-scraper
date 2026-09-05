@@ -17,7 +17,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from wrc_scraper.config import env_bool, env_str
+from wrc_scraper.config import TransformSettings, env_bool, env_str
 from wrc_scraper.storage.minio_repository import MinioRepository
 from wrc_scraper.storage.mongo_repository import MongoRepository
 
@@ -47,23 +47,57 @@ class StorageSettings:
         )
 
 
-def build_mongo(settings: StorageSettings) -> tuple[Any, MongoRepository]:
-    """Return (client, repository). The client is returned separately because
-    only the caller knows when the run is over and it should be closed.
-    """
+def _mongo_client(settings: StorageSettings) -> Any:
     import pymongo  # noqa: PLC0415 -- optional/heavy import kept local
 
-    client = pymongo.MongoClient(settings.mongo_uri)
-    return client, MongoRepository(client, settings.mongo_database, settings.mongo_collection)
+    return pymongo.MongoClient(settings.mongo_uri)
 
 
-def build_minio(settings: StorageSettings) -> MinioRepository:
+def _minio_client(settings: StorageSettings) -> Any:
     from minio import Minio  # noqa: PLC0415 -- optional/heavy import kept local
 
-    client = Minio(
+    return Minio(
         settings.minio_endpoint,
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
         secure=settings.minio_secure,
     )
-    return MinioRepository(client, settings.minio_bucket)
+
+
+def build_mongo(settings: StorageSettings) -> tuple[Any, MongoRepository]:
+    """Return (client, repository) for the Landing Zone collection. The client
+    is returned separately because only the caller knows when the run is over
+    and it should be closed.
+    """
+    client = _mongo_client(settings)
+    return client, MongoRepository(client, settings.mongo_database, settings.mongo_collection)
+
+
+def build_minio(settings: StorageSettings) -> MinioRepository:
+    """Return a repository for the Landing Zone bucket."""
+    return MinioRepository(_minio_client(settings), settings.minio_bucket)
+
+
+def build_transformed_mongo(
+    settings: StorageSettings, transform: TransformSettings
+) -> tuple[Any, MongoRepository]:
+    """Return (client, repository) for the Phase 4 transformed-metadata
+    collection -- the same Mongo cluster/database as the Landing Zone, a
+    different collection (`transform.mongo_transformed_collection`). Same
+    `MongoRepository` class as the landing side (CLAUDE.md: don't fork the
+    repository classes), just pointed elsewhere.
+    """
+    client = _mongo_client(settings)
+    return client, MongoRepository(
+        client, settings.mongo_database, transform.mongo_transformed_collection
+    )
+
+
+def build_transformed_minio(
+    settings: StorageSettings, transform: TransformSettings
+) -> MinioRepository:
+    """Return a repository for the Phase 4 transformed-documents bucket -- the
+    same MinIO endpoint/credentials, a different bucket
+    (`transform.minio_transformed_bucket`).
+    """
+    return MinioRepository(_minio_client(settings), transform.minio_transformed_bucket)

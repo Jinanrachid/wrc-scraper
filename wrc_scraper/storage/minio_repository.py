@@ -40,3 +40,14 @@ class MinioRepository:
             length=len(data),
             content_type=content_type,
         )
+
+    def get_object(self, key: str) -> bytes:
+        """Fetch an object's full bytes. Used by the transformation stage to
+        read Landing Zone artifacts -- never to write back to them.
+        """
+        response = self._client.get_object(self._bucket, key)
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()

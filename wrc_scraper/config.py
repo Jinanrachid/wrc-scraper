@@ -184,3 +184,40 @@ class ScrapingSettings:
             conditional_get_enabled=env_bool("WRC_CONDITIONAL_GET", True),
             log_level=env_str("WRC_LOG_LEVEL", "INFO"),
         )
+
+
+# -- transformation (Phase 4) --------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class TransformSettings:
+    mongo_transformed_collection: str
+    minio_transformed_bucket: str
+    keep_images: bool
+    near_tie_chars: int
+    concurrency: int
+
+    @classmethod
+    def from_env(cls) -> TransformSettings:
+        return cls(
+            mongo_transformed_collection=env_str(
+                "WRC_MONGO_TRANSFORMED_COLLECTION", "transformed_metadata"
+            ),
+            minio_transformed_bucket=env_str("WRC_MINIO_TRANSFORMED_BUCKET", "wrc-transformed"),
+            # Default drops all <img> from cleaned HTML (docs/SCRAPY_EXPERIMENTS.md
+            # Sec 22): the only images observed inside div.content are invisible
+            # 1x1 layout spacers, which add no content to a text corpus. Set true
+            # to keep images instead (src rewritten to an absolute URL).
+            keep_images=env_bool("WRC_TRANSFORM_KEEP_IMAGES", False),
+            # Variant-cluster canonical selection (Sec 19/22): candidates whose
+            # cleaned content length differs by at most this many characters are
+            # logged as an ambiguous near-tie rather than decided silently.
+            near_tie_chars=env_int("WRC_TRANSFORM_NEAR_TIE_CHARS", 50),
+            # Bounded thread-pool size for processing independent (body_slug,
+            # identifier) groups concurrently -- the workload is I/O-bound
+            # (Mongo reads/writes, MinIO reads/writes, HTML parsing in between),
+            # and both pymongo's MongoClient and the minio-py client are safe
+            # for concurrent use from multiple threads. 1 disables the pool
+            # entirely (fully sequential), matching the original behavior.
+            concurrency=env_int("WRC_TRANSFORM_CONCURRENCY", 8),
+        )
