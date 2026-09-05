@@ -119,13 +119,28 @@ class MongoRepository:
             update["remote_etag"] = remote_etag
         self._collection.update_one({"_id": doc_id}, {"$set": update})
 
-    def mark_failed(self, doc_id: str, *, stage: str, reason: str, now: str) -> None:
+    def mark_failed(
+        self,
+        doc_id: str,
+        *,
+        stage: str,
+        reason: str,
+        now: str,
+        candidate_errors: list[dict] | None = None,
+    ) -> None:
+        error: dict[str, object] = {
+            "stage": stage,
+            "reason": reason,
+            "occurred_at": now,
+        }
+        if candidate_errors:
+            error["candidate_errors"] = candidate_errors
         self._collection.update_one(
             {"_id": doc_id},
             {
                 "$set": {
                     "status": "failed",
-                    "error": {"stage": stage, "reason": reason, "occurred_at": now},
+                    "error": error,
                     "last_checked_at": now,
                 }
             },
