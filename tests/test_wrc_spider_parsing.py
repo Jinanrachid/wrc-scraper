@@ -767,3 +767,104 @@ def test_an_unreachable_advisor_is_reported_once_and_leaves_the_crawl_unconditio
     events = [json.loads(r.message) for r in caplog.records]
     unavailable = [e for e in events if e["event"] == "conditional_get_unavailable"]
     assert len(unavailable) == 1  # logged once, not per request
+
+
+# -- per-row exception isolation in parse_listing (robustness pass, Fix 1) -----
+
+
+def test_parse_listing_unexpected_row_error_is_isolated_and_page_continues(
+    spider: WrcSpider,
+    partition: DatePartition,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A novel, unexpected surprise while building ONE row's detail request
+    must not abort the rest of the page. Rows 1 and 3 still get detail
+    requests, the middle row is logged as record_failed with the exception
+    repr as its reason, and pagination still continues to the next page.
+    """
+    key = _seed_partition_state(spider, "15376", partition)
+    html = b"""<html><body><ul>
+      <li class="each-item"><div class="row"><div class="col-sm-9">
+        <h2 class="title" title="ADJ-1"><a href="/en/cases/2024/january/adj-1.html">ADJ-1</a></h2>
+        <p class="description" title="Row one">Row one</p>
+      </div><div class="col-sm-3"><span class="date">01/01/2024</span></div></div></li>
+      <li class="each-item"><div class="row"><div class="col-sm-9">
+        <h2 class="title" title="ADJ-2"><a href="/en/cases/2024/january/adj-2.html">ADJ-2</a></h2>
+        <p class="description" title="Row two">Row two</p>
+      </div><div class="col-sm-3"><span class="date">01/01/2024</span></div></div></li>
+      <li class="each-item"><div class="row"><div class="col-sm-9">
+        <h2 class="title" title="ADJ-3"><a href="/en/cases/2024/january/adj-3.html">ADJ-3</a></h2>
+        <p class="description" title="Row three">Row three</p>
+      </div><div class="col-sm-3"><span class="date">01/01/2024</span></div></div></li>
+    </ul></body></html>"""
+    request = Request(
+        "https://www.workplacerelations.ie/en/search/?body=15376",
+        meta={"body": "15376", "partition": partition, "page_number": 1},
+    )
+    response = HtmlResponse(url=request.url, body=html, encoding="utf-8", request=request)
+
+    # Raise only on the 2nd row's _mark_pending call, leaving rows 1 and 3 fine.
+    original_mark_pending = spider._mark_pending
+    calls = {"n": 0}
+
+    def flaky_mark_pending(*args: object, **kwargs: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("unexpected selector surprise")
+        return original_mark_pending(*args, **kwargs)
+
+    monkeypatch.setattr(spider, "_mark_pending", flaky_mark_pending)
+
+    with caplog.at_level(logging.INFO, logger="wrc.events"):
+        results = list(spider.parse_listing(response))
+
+    follow_requests = [
+        r for r in results if isinstance(r, Request) and r.callback == spider.parse_detail
+    ]
+    next_page_requests = [
+        r for r in results if isinstance(r, Request) and r.callback == spider.parse_listing
+    ]
+
+    # Rows 1 and 3 survived; only the middle row was dropped.
+    assert [r.cb_kwargs["identifier"] for r in follow_requests] == ["ADJ-1", "ADJ-3"]
+    # Pagination continuation is still emitted despite the mid-page error.
+    assert len(next_page_requests) == 1
+
+    assert spider._partition_state[key]["records_found"] == 3
+    assert spider._partition_state[key]["records_failed"] == 1
+    # Only the two surviving rows were marked pending (the failed row was not).
+    assert len(spider._partition_state[key]["pending"]) == 2
+
+    failed = [e for e in _events_from(caplog) if e["event"] == "record_failed"]
+    assert len(failed) == 1
+    assert failed[0]["reason"] == "RuntimeError('unexpected selector surprise')"
+    assert failed[0]["listing_url"] == response.url
+
+
+# -- empty-body validation in parse_document_binary (robustness pass, Fix 2) ---
+
+
+def test_a_200_answer_with_an_empty_body_is_recorded_as_a_failure(
+    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-304 response with a zero-length body is not a successful fetch:
+    it must be an explicit, logged failure (http_status 200, "empty" reason,
+    records_failed incremented) -- never a silently stored 0-byte document.
+    """
+    spider._conditional_get = _advisor_returning(None)
+    request = _binary_request(spider, partition)
+
+    with caplog.at_level(logging.INFO, logger="wrc.events"):
+        response = HtmlResponse(url=request.url, status=200, body=b"", request=request)
+        items = list(spider.parse_document_binary(response, **request.cb_kwargs))
+
+    assert items == []  # no record yielded for an empty body
+    assert spider._totals["records_failed"] == 1
+    assert spider._totals["records_scraped"] == 0
+    assert spider._totals["documents_not_modified"] == 0
+
+    failed = [e for e in _events_from(caplog) if e["event"] == "record_failed"]
+    assert len(failed) == 1
+    assert "empty" in failed[0]["reason"]
+    assert failed[0]["http_status"] == 200
