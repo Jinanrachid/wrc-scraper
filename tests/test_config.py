@@ -11,6 +11,7 @@ import pytest
 
 from wrc_scraper.config import (
     ScrapingSettings,
+    TransformSettings,
     env_bool,
     env_float,
     env_int,
@@ -75,3 +76,23 @@ def test_scraping_settings_autothrottle_target_tracks_concurrency(
     assert cfg.concurrent_requests == 8
     assert cfg.concurrent_requests_per_domain == 8
     assert cfg.autothrottle_target_concurrency == 8.0
+
+
+def test_transform_settings_concurrency_defaults_to_eight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WRC_TRANSFORM_CONCURRENCY", raising=False)
+    assert TransformSettings.from_env().concurrency == 8
+
+
+def test_transform_settings_concurrency_reads_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WRC_TRANSFORM_CONCURRENCY", "1")
+    assert TransformSettings.from_env().concurrency == 1
+
+
+def test_transform_settings_concurrency_malformed_raises_with_variable_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WRC_TRANSFORM_CONCURRENCY", "many")
+    with pytest.raises(ValueError, match="WRC_TRANSFORM_CONCURRENCY must be an integer"):
+        TransformSettings.from_env()

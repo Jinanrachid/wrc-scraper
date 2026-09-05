@@ -29,6 +29,37 @@ class FakeMongoRepository:
             if doc.get("body_slug") == body_slug and doc.get("identifier") == identifier
         )
 
+    def find_stored(self, start_date: str, end_date: str) -> list[dict]:
+        matches = [
+            doc
+            for doc in self.docs.values()
+            if doc.get("status") == "stored"
+            and start_date <= doc.get("partition_date", "") <= end_date
+        ]
+        # `.get(..., "")` mirrors real MongoDB's tolerant sort (a missing field
+        # sorts as if absent, it never raises) -- a landing record can be
+        # malformed/missing a field, and that must surface as a per-record
+        # transform failure, not a crash while merely listing candidates.
+        matches.sort(
+            key=lambda doc: (
+                doc.get("body_slug", ""),
+                doc.get("identifier", ""),
+                doc.get("detail_url", ""),
+            )
+        )
+        return [dict(doc) for doc in matches]
+
+    def find_stored_by_identifier(self, body_slug: str, identifier: str) -> list[dict]:
+        matches = [
+            doc
+            for doc in self.docs.values()
+            if doc.get("status") == "stored"
+            and doc.get("body_slug") == body_slug
+            and doc.get("identifier") == identifier
+        ]
+        matches.sort(key=lambda doc: doc.get("detail_url", ""))
+        return [dict(doc) for doc in matches]
+
     def upsert_pending(self, doc_id: str, *, now: str, **fields: object) -> dict:
         self.upsert_calls += 1
         if doc_id not in self.docs:
@@ -57,6 +88,7 @@ class FakeMongoRepository:
         remote_etag: str | None,
         now: str,
         content_changed: bool,
+        extra: dict[str, object] | None = None,
     ) -> None:
         if self.fail_on_mark_stored:
             raise RuntimeError("simulated mongo confirmation failure")
@@ -73,6 +105,8 @@ class FakeMongoRepository:
         )
         if content_changed:
             doc["last_changed_at"] = now
+        if extra:
+            doc.update(extra)
 
     def mark_unchanged(self, doc_id: str, *, remote_etag: str | None, now: str) -> None:
         self.mark_unchanged_calls += 1
@@ -107,3 +141,6 @@ class FakeMinioRepository:
             raise RuntimeError("simulated minio failure")
         self.put_calls += 1
         self.objects[key] = data
+
+    def get_object(self, key: str) -> bytes:
+        return self.objects[key]
