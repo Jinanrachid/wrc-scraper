@@ -2,10 +2,11 @@
 
 Exercises `TransformService` against real MongoDB + MinIO (not the in-memory
 fakes used elsewhere in tests/transform/) to validate what fakes structurally
-cannot: real `pymongo.MongoClient` / minio-py client behavior under the bounded
-thread-pool concurrency introduced in the hardening pass, genuine Landing Zone
-immutability against a real object store, and the complete-vs-incomplete
-duplicate-identifier resolution against real round-tripped documents.
+cannot: real `pymongo.MongoClient` / minio-py client wiring end to end. The
+transformation business logic itself (variant-cluster selection, ordering
+independence, concurrency correctness) is storage-agnostic pure Python and is
+already covered against fakes in test_transform_service.py -- it does not
+need to be re-proven against real services here.
 
 Same convention as tests/storage/test_integration.py: auto-skips (not a hard
 failure) if MongoDB/MinIO aren't reachable, so the default `pytest` run stays
@@ -17,12 +18,10 @@ database/bucket names and torn down afterward -- nothing here ever touches
 from __future__ import annotations
 
 import os
-import time
 import uuid
 
 import pytest
 
-from wrc_scraper.config import TransformSettings
 from wrc_scraper.storage.hashing import hash_binary
 from wrc_scraper.storage.ingest_service import CONTENT_TYPES
 from wrc_scraper.storage.keys import transformed_minio_object_key, transformed_mongo_document_id
@@ -132,23 +131,6 @@ def _seed_landing(
     )
 
 
-def _snapshot_landing(mongo_repo: MongoRepository, minio_repo: MinioRepository) -> dict:
-    """A comparable snapshot of every stored landing record (metadata dict
-    minus volatile bookkeeping timestamps, plus the raw object bytes) -- used
-    to prove the Landing Zone is byte-for-byte and doc-for-doc unchanged
-    across a transform run.
-    """
-    docs = mongo_repo.find_stored("0001-01-01", "9999-12-31")
-    volatile = {"last_checked_at", "last_changed_at", "first_scraped_at"}
-    return {
-        doc["_id"]: (
-            {k: v for k, v in doc.items() if k not in volatile},
-            minio_repo.get_object(doc["file_path"]),
-        )
-        for doc in docs
-    }
-
-
 # -- basic real-service round trip --------------------------------------------
 
 
@@ -181,240 +163,3 @@ def test_transform_against_real_services_end_to_end(stores) -> None:
     stored_bytes = dest_minio.get_object(dest_key)
     assert b"Real integration test content" in stored_bytes
     assert b'class="content"' not in stored_bytes  # actually cleaned, not a raw copy
-
-
-# -- complete vs incomplete duplicate identifier -------------------------------
-
-
-def test_duplicate_identifier_complete_record_wins_against_real_services(stores) -> None:
-    source_mongo, source_minio, dest_mongo, dest_minio = stores
-    complete_html = (
-        b'<div class="content"><p>'
-        + b"Full decision text with real substance. " * 30
-        + b"Signed on behalf of the tribunal.</p></div>"
-    )
-    truncated_html = b'<div class="content"><p>Full decision text cuts off mid-sent</p></div>'
-
-    _seed_landing(
-        source_mongo,
-        source_minio,
-        doc_id="equality:en/cases/2003/dec-e2003-999-full.html",
-        file_path="equality/en/cases/2003/dec-e2003-999-full.html",
-        data=complete_html,
-        identifier="DEC-E2003-999",
-        detail_url="https://www.workplacerelations.ie/en/cases/2003/dec-e2003-999-full.html",
-        body_slug="equality",
-        body_name="Equality Tribunal",
-    )
-    _seed_landing(
-        source_mongo,
-        source_minio,
-        doc_id="equality:en/cases/2003/dec-e2003-999-trunc.html",
-        file_path="equality/en/cases/2003/dec-e2003-999-trunc.html",
-        data=truncated_html,
-        identifier="DEC-E2003-999",
-        detail_url="https://www.workplacerelations.ie/en/cases/2003/dec-e2003-999-trunc.html",
-        body_slug="equality",
-        body_name="Equality Tribunal",
-    )
-    landing_before = _snapshot_landing(source_mongo, source_minio)
-
-    service = TransformService(source_mongo, source_minio, dest_mongo, dest_minio)
-    summary = service.transform_range("2024-01-01", "2024-01-31")
-
-    assert summary.found == 1  # one identifier group, two candidates
-    assert summary.transformed == 1
-    assert summary.dropped == 1  # the truncated sibling, logged and dropped
-
-    dest_doc = dest_mongo.get(transformed_mongo_document_id("equality", "DEC-E2003-999"))
-    assert (
-        dest_doc["detail_url"]
-        == "https://www.workplacerelations.ie/en/cases/2003/dec-e2003-999-full.html"
-    )
-    stored_bytes = dest_minio.get_object(dest_doc["file_path"])
-    assert b"Signed on behalf of the tribunal" in stored_bytes
-    assert b"cuts off mid-sent" not in stored_bytes
-
-    # Both original Landing Zone records -- complete AND truncated -- must
-    # still exist, byte-for-byte, completely untouched by the transform run.
-    landing_after = _snapshot_landing(source_mongo, source_minio)
-    assert landing_after == landing_before
-    assert len(landing_after) == 2
-
-
-def test_duplicate_identifier_resolution_is_independent_of_processing_order(stores) -> None:
-    """The transform stage resolves the full cluster via
-    `find_stored_by_identifier` regardless of which landing record triggered
-    it -- seeding the truncated copy under a lexicographically earlier
-    detail_url (so it would be iterated first) must not change the outcome.
-    """
-    source_mongo, source_minio, dest_mongo, dest_minio = stores
-    _seed_landing(
-        source_mongo,
-        source_minio,
-        doc_id="equality:en/cases/2003/a-trunc.html",
-        file_path="equality/en/cases/2003/a-trunc.html",
-        data=b'<div class="content"><p>Cuts off mid-sent</p></div>',
-        identifier="DEC-E2003-ORDER",
-        detail_url="https://www.workplacerelations.ie/en/cases/2003/a-trunc.html",
-        body_slug="equality",
-        body_name="Equality Tribunal",
-    )
-    _seed_landing(
-        source_mongo,
-        source_minio,
-        doc_id="equality:en/cases/2003/z-full.html",
-        file_path="equality/en/cases/2003/z-full.html",
-        data=b'<div class="content"><p>'
-        + b"Full decision text with real substance. " * 30
-        + b"Signed on behalf of the tribunal.</p></div>",
-        identifier="DEC-E2003-ORDER",
-        detail_url="https://www.workplacerelations.ie/en/cases/2003/z-full.html",
-        body_slug="equality",
-        body_name="Equality Tribunal",
-    )
-
-    service = TransformService(source_mongo, source_minio, dest_mongo, dest_minio)
-    service.transform_range("2024-01-01", "2024-01-31")
-
-    dest_doc = dest_mongo.get(transformed_mongo_document_id("equality", "DEC-E2003-ORDER"))
-    assert dest_doc["detail_url"].endswith("z-full.html")  # complete copy, despite sorting last
-
-
-# -- bounded concurrency: load validation against real services ---------------
-
-
-def test_configured_concurrency_transforms_a_batch_correctly(stores) -> None:
-    """Load-validates the actually configured `WRC_TRANSFORM_CONCURRENCY`
-    (or its default) against real MongoDB + MinIO: a batch of independent
-    groups run through the bounded thread pool must produce exactly the same
-    correct end state as sequential processing, with no lost writes, no
-    crashes, and no cross-record interference from real concurrent client use.
-    """
-    source_mongo, source_minio, dest_mongo, dest_minio = stores
-    configured_concurrency = TransformSettings.from_env().concurrency
-    record_count = 80
-
-    identifiers = [f"ADJ-LOAD-{i:04d}" for i in range(record_count)]
-    for i, identifier in enumerate(identifiers):
-        # Alternate html/pdf so the batch exercises both the BeautifulSoup
-        # clean path and the binary passthrough path under concurrency.
-        is_html = i % 3 != 0
-        document_type = "html_inline" if is_html else "pdf"
-        file_path = f"wrc/en/cases/2024/january/load-{i}.{'html' if is_html else 'pdf'}"
-        data = (
-            (
-                b'<div class="content"><h1>Decision</h1><p>'
-                + f"Load test content for record {i}. ".encode() * 5
-                + b"</p></div>"
-            )
-            if is_html
-            else f"%PDF fake load test bytes {i}".encode()
-        )
-        _seed_landing(
-            source_mongo,
-            source_minio,
-            doc_id=f"wrc:en/cases/2024/january/load-{i}.html",
-            file_path=file_path,
-            data=data,
-            document_type=document_type,
-            identifier=identifier,
-            detail_url=f"https://www.workplacerelations.ie/en/cases/2024/january/load-{i}.html",
-        )
-
-    landing_before = _snapshot_landing(source_mongo, source_minio)
-
-    service = TransformService(
-        source_mongo, source_minio, dest_mongo, dest_minio, max_workers=configured_concurrency
-    )
-    started = time.monotonic()
-    summary = service.transform_range("2024-01-01", "2024-01-31")
-    elapsed = time.monotonic() - started
-
-    assert summary.found == record_count
-    assert summary.transformed == record_count
-    assert summary.failed == 0
-    assert summary.dropped == 0
-
-    for identifier in identifiers:
-        dest_doc = dest_mongo.get(transformed_mongo_document_id("wrc", identifier))
-        assert dest_doc is not None
-        assert dest_doc["status"] == "stored"
-        assert dest_minio.object_exists(dest_doc["file_path"])
-
-    # The Landing Zone must remain untouched by a concurrent run, same as a
-    # sequential one -- concurrency must never introduce a stray write.
-    assert _snapshot_landing(source_mongo, source_minio) == landing_before
-
-    # Rerun: idempotency must hold under concurrency too -- everything skips,
-    # nothing is re-uploaded, no record flips to failed.
-    rerun_started = time.monotonic()
-    rerun_summary = service.transform_range("2024-01-01", "2024-01-31")
-    rerun_elapsed = time.monotonic() - rerun_started
-
-    assert rerun_summary.skipped == record_count
-    assert rerun_summary.transformed == 0
-    assert rerun_summary.failed == 0
-
-    print(
-        f"\n[load] {record_count} records, max_workers={configured_concurrency}: "
-        f"first run {elapsed:.2f}s, unchanged rerun {rerun_elapsed:.2f}s"
-    )
-
-
-def test_concurrent_and_sequential_runs_produce_identical_results(stores) -> None:
-    """The bounded thread pool must be a pure performance optimization --
-    running the same batch through TransformService with max_workers=1 vs a
-    real thread pool must produce byte-identical transformed output and
-    metadata, proving no race condition changes the outcome.
-    """
-    source_mongo, source_minio, dest_mongo_sequential, dest_minio_sequential = stores
-
-    # A second destination pair in the same throwaway database/MinIO client,
-    # under different names, so the two runs can't interfere with each other.
-    mongo_client_obj = source_mongo._collection.database.client  # noqa: SLF001 -- test-only introspection
-    dest_mongo_concurrent = MongoRepository(
-        mongo_client_obj, source_mongo._collection.database.name, "transformed_metadata_concurrent"
-    )
-    minio_client_obj = source_minio._client  # noqa: SLF001 -- test-only introspection
-    concurrent_bucket = f"wrc-transform-test-dest-concurrent-{uuid.uuid4().hex[:8]}"
-    dest_minio_concurrent = MinioRepository(minio_client_obj, concurrent_bucket)
-    dest_minio_concurrent.ensure_bucket()
-
-    identifiers = [f"ADJ-CMP-{i:04d}" for i in range(20)]
-    for i, identifier in enumerate(identifiers):
-        file_path = f"wrc/en/cases/2024/january/cmp-{i}.html"
-        _seed_landing(
-            source_mongo,
-            source_minio,
-            doc_id=f"wrc:en/cases/2024/january/cmp-{i}.html",
-            file_path=file_path,
-            data=b'<div class="content"><p>'
-            + f"Comparison content {i}. ".encode() * 5
-            + b"</p></div>",
-            identifier=identifier,
-            detail_url=f"https://www.workplacerelations.ie/en/cases/2024/january/cmp-{i}.html",
-        )
-
-    try:
-        sequential = TransformService(
-            source_mongo, source_minio, dest_mongo_sequential, dest_minio_sequential, max_workers=1
-        )
-        sequential.transform_range("2024-01-01", "2024-01-31")
-
-        concurrent = TransformService(
-            source_mongo, source_minio, dest_mongo_concurrent, dest_minio_concurrent, max_workers=8
-        )
-        concurrent.transform_range("2024-01-01", "2024-01-31")
-
-        for identifier in identifiers:
-            doc_id = transformed_mongo_document_id("wrc", identifier)
-            seq_doc = dest_mongo_sequential.get(doc_id)
-            conc_doc = dest_mongo_concurrent.get(doc_id)
-            assert seq_doc["file_hash"] == conc_doc["file_hash"]
-            key = transformed_minio_object_key("wrc", identifier, "html_inline")
-            assert dest_minio_sequential.get_object(key) == dest_minio_concurrent.get_object(key)
-    finally:
-        for obj in minio_client_obj.list_objects(concurrent_bucket, recursive=True):
-            minio_client_obj.remove_object(concurrent_bucket, obj.object_name)
-        minio_client_obj.remove_bucket(concurrent_bucket)

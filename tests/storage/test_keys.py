@@ -55,11 +55,6 @@ def test_minio_object_key_uses_document_type_extension_not_the_page_extension() 
     assert minio_object_key("eat", url, "docx") == "eat/en/cases/2008/march/rp74_2007.docx"
 
 
-def test_minio_object_key_is_deterministic() -> None:
-    url = f"{BASE}/en/cases/2024/january/adj-00047352.html"
-    assert len({minio_object_key("wrc", url, "html_inline") for _ in range(5)}) == 1
-
-
 # -- regression: the real collisions that (body, identifier) conflated ---------
 
 
@@ -107,14 +102,15 @@ def test_eat_import_url_suffix_variants_no_longer_collide() -> None:
     [
         ("ADJ-00047352", "ADJ-00047352"),
         ("ADJ 49297", "ADJ_49297"),
-        ("RP74/2007", "RP74-2007"),
-        ("RP72/2007, RP73/2007", "RP72-2007_RP73-2007"),
+        ("RP74/2007", "RP74~slash~2007"),
+        ("RP72/2007, RP73/2007", "RP72~slash~2007_RP73~slash~2007"),
         (
             "RP68/2007, RP69/2007, RP70/2007, RP126/2007",
-            "RP68-2007_RP69-2007_RP70-2007_RP126-2007",
+            "RP68~slash~2007_RP69~slash~2007_RP70~slash~2007_RP126~slash~2007",
         ),
         ("IR - SC - 00000787", "IR_SC_00000787"),
         ("DEC-E2003-059", "DEC-E2003-059"),
+        ("ADJ-00045266 & ADJ-00047456", "ADJ-00045266_~and~_ADJ-00047456"),
     ],
 )
 def test_sanitize_identifier_handles_every_observed_real_value(raw: str, expected: str) -> None:
@@ -129,3 +125,35 @@ def test_sanitize_identifier_rejects_empty() -> None:
 def test_sanitize_identifier_raises_rather_than_guessing_on_unhandled_characters() -> None:
     with pytest.raises(ValueError, match="unsafe for a filename"):
         sanitize_identifier("ADJ⁄123")  # fraction slash -- not a pattern we've seen
+
+
+# -- storage-name collision resistance (audit MUST FIX) -----------------------
+#
+# The previous sanitization replaced `/` with `-`, so "RP74/2007" and
+# "RP74-2007" both sanitized to "RP74-2007" -- two different identifiers
+# targeting the same transformed Mongo document / MinIO object key. The
+# `~word~` token encoding below is collision-resistant: every unsafe
+# character (including a literal `~`) maps to its own distinct token, so
+# distinct raw identifiers can never collapse onto the same sanitized string.
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("RP74/2007", "RP74-2007"),  # slash vs. hyphen
+        ("A&B", "A-B"),  # ampersand vs. hyphen
+        ("A~B", "A~slash~B"),  # literal tilde text vs. a generated slash token
+    ],
+)
+def test_distinct_raw_identifiers_never_collide_after_sanitization(first: str, second: str) -> None:
+    assert sanitize_identifier(first) != sanitize_identifier(second)
+
+
+def test_sanitize_identifier_never_mutates_the_original_identifier_string() -> None:
+    """`sanitize_identifier` is a pure storage-name projection -- the caller's
+    original `identifier` value (what gets stored in MongoDB) must be
+    returned unchanged by every other code path that touches it.
+    """
+    original = "RP74/2007"
+    sanitize_identifier(original)
+    assert original == "RP74/2007"

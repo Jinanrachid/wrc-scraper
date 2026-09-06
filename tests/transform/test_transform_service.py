@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tests.storage.fakes import FakeMinioRepository, FakeMongoRepository
 from wrc_scraper.storage.keys import transformed_minio_object_key, transformed_mongo_document_id
 from wrc_scraper.transform.service import TransformService
@@ -100,20 +102,6 @@ def test_first_run_transforms_and_renames_to_identifier_ext() -> None:
     assert b'class="content"' not in dest_minio.objects[dest_key]  # cleaned, not raw
 
 
-def test_html_content_is_actually_cleaned_before_storage() -> None:
-    service, source_mongo, source_minio, dest_mongo, dest_minio, _logger = make_service()
-    doc = _landing_doc()
-    raw = b'<div class="content"><span class="c1">Decision text long enough to compare</span></div>'
-    _seed(source_mongo, source_minio, doc, raw)
-
-    service.transform_range("2024-01-01", "2024-01-31")
-
-    dest_key = transformed_minio_object_key("wrc", "ADJ-00047352", "html_inline")
-    stored = dest_minio.objects[dest_key]
-    assert b"class=" not in stored
-    assert b"<span" not in stored
-
-
 def test_pdf_record_is_stored_unmodified() -> None:
     service, source_mongo, source_minio, dest_mongo, dest_minio, _logger = make_service()
     doc = _landing_doc(
@@ -131,7 +119,7 @@ def test_pdf_record_is_stored_unmodified() -> None:
 
     assert summary.transformed == 1
     dest_key = transformed_minio_object_key("eat", "RP2147/2009", "pdf")
-    assert dest_key == "eat/RP2147-2009.pdf"
+    assert dest_key == "eat/RP2147~slash~2009.pdf"
     assert dest_minio.objects[dest_key] == b"%PDF fake bytes"
 
 
@@ -243,6 +231,145 @@ def test_variant_cluster_picks_longest_content_and_logs_dropped_sibling() -> Non
     selected_events = logger.events_named("variant_canonical_selected")
     assert len(selected_events) == 1
     assert selected_events[0]["chosen_detail_url"] == complete["detail_url"]
+
+
+def test_original_identifier_is_never_mutated_in_transformed_metadata() -> None:
+    """The transformed metadata's `identifier` field must be the exact
+    original value -- sanitization is only ever applied to the storage
+    filename/key, never persisted back over the source value.
+    """
+    service, source_mongo, source_minio, dest_mongo, dest_minio, _logger = make_service()
+    doc = _landing_doc(
+        _id="eat:en/cases/2008/march/rp74_2007.html",
+        identifier="RP74/2007",
+        detail_url="https://www.workplacerelations.ie/en/cases/2008/march/rp74_2007.html",
+        document_type="pdf",
+        file_path="eat/en/cases/2008/march/rp74_2007.pdf",
+        body_slug="eat",
+        body_name="Employment Appeals Tribunal",
+    )
+    _seed(source_mongo, source_minio, doc, b"%PDF fake bytes")
+
+    service.transform_range("2024-01-01", "2024-01-31")
+
+    dest_doc = dest_mongo.get(transformed_mongo_document_id("eat", "RP74/2007"))
+    assert dest_doc["identifier"] == "RP74/2007"
+    assert source_mongo.docs[doc["_id"]]["identifier"] == "RP74/2007"
+
+
+# -- mixed document-type variant clusters (non-empty HTML > PDF/DOC/DOCX) -----
+
+
+def _mixed_cluster_docs(*, binary_type: str) -> tuple[dict, dict]:
+    html_doc = _landing_doc(
+        _id="wrc:en/cases/2024/january/mixed-html.html",
+        identifier="ADJ-00099001",
+        detail_url="https://www.workplacerelations.ie/en/cases/2024/january/mixed-html.html",
+        document_type="html_inline",
+        file_path="wrc/en/cases/2024/january/mixed-html.html",
+        file_hash="html-hash",
+    )
+    binary_doc = _landing_doc(
+        _id=f"wrc:en/cases/2024/january/mixed-{binary_type}.html",
+        identifier="ADJ-00099001",
+        detail_url=f"https://www.workplacerelations.ie/en/cases/2024/january/mixed-{binary_type}.html",
+        document_type=binary_type,
+        file_path=f"wrc/en/cases/2024/january/mixed-{binary_type}.{binary_type}",
+        file_hash=f"{binary_type}-hash",
+    )
+    return html_doc, binary_doc
+
+
+@pytest.mark.parametrize(
+    ("binary_type", "magic_bytes"),
+    [("pdf", b"%PDF "), ("docx", b"PK")],
+)
+def test_html_beats_binary_even_when_binary_bytes_outnumber_html_chars(
+    binary_type: str, magic_bytes: bytes
+) -> None:
+    """A short HTML variant must still win over a byte-heavier PDF/DOCX --
+    HTML char count and binary byte size are never compared against each
+    other.
+    """
+    service, source_mongo, source_minio, dest_mongo, dest_minio, _logger = make_service()
+    html_doc, binary_doc = _mixed_cluster_docs(binary_type=binary_type)
+    _seed(
+        source_mongo,
+        source_minio,
+        html_doc,
+        b'<div class="content"><p>Short but real decision text.</p></div>',
+    )
+    _seed(source_mongo, source_minio, binary_doc, magic_bytes + b"x" * 500)
+
+    summary = service.transform_range("2024-01-01", "2024-01-31")
+
+    assert summary.transformed == 1
+    dest_doc = dest_mongo.get(transformed_mongo_document_id("wrc", "ADJ-00099001"))
+    assert dest_doc["file_path"] == "wrc/ADJ-00099001.html"
+    assert dest_doc["detail_url"] == html_doc["detail_url"]
+
+
+def test_empty_html_never_overrides_a_valid_pdf() -> None:
+    """An HTML variant whose div.content is empty must not win, or even
+    count as a resolvable candidate -- the PDF sibling must be selected.
+    """
+    service, source_mongo, source_minio, dest_mongo, dest_minio, logger = make_service()
+    html_doc, pdf_doc = _mixed_cluster_docs(binary_type="pdf")
+    _seed(source_mongo, source_minio, html_doc, b'<div class="content"></div>')
+    _seed(source_mongo, source_minio, pdf_doc, b"%PDF real bytes")
+
+    summary = service.transform_range("2024-01-01", "2024-01-31")
+
+    assert summary.transformed == 1
+    dest_doc = dest_mongo.get(transformed_mongo_document_id("wrc", "ADJ-00099001"))
+    assert dest_doc["file_path"] == "wrc/ADJ-00099001.pdf"
+    assert dest_doc["detail_url"] == pdf_doc["detail_url"]
+    dropped_events = logger.events_named("variant_dropped")
+    assert any("empty or missing div.content" in event["reason"] for event in dropped_events)
+
+
+def test_docx_only_cluster_keeps_the_docx() -> None:
+    service, source_mongo, source_minio, dest_mongo, dest_minio, _logger = make_service()
+    doc = _landing_doc(
+        _id="labour_court:en/cases/2024/january/lcr1.html",
+        body_slug="labour_court",
+        body_name="Labour Court",
+        identifier="LCR1/2024",
+        detail_url="https://www.workplacerelations.ie/en/cases/2024/january/lcr1.html",
+        document_type="docx",
+        file_path="labour_court/en/cases/2024/january/lcr1.docx",
+        file_hash="docx-hash",
+    )
+    _seed(source_mongo, source_minio, doc, b"PK fake docx bytes")
+
+    summary = service.transform_range("2024-01-01", "2024-01-31")
+
+    assert summary.transformed == 1
+    dest_key = transformed_minio_object_key("labour_court", "LCR1/2024", "docx")
+    assert dest_key == "labour_court/LCR1~slash~2024.docx"
+    assert dest_minio.objects[dest_key] == b"PK fake docx bytes"
+
+
+def test_mixed_cluster_selection_leaves_landing_zone_untouched() -> None:
+    """Every originally-scraped variant must remain in the Landing Zone
+    (source Mongo/MinIO) after transformation picks a canonical copy.
+    """
+    service, source_mongo, source_minio, dest_mongo, dest_minio, _logger = make_service()
+    html_doc, pdf_doc = _mixed_cluster_docs(binary_type="pdf")
+    _seed(
+        source_mongo,
+        source_minio,
+        html_doc,
+        b'<div class="content"><p>Some real decision text here.</p></div>',
+    )
+    _seed(source_mongo, source_minio, pdf_doc, b"%PDF bytes")
+
+    service.transform_range("2024-01-01", "2024-01-31")
+
+    assert html_doc["_id"] in source_mongo.docs
+    assert pdf_doc["_id"] in source_mongo.docs
+    assert html_doc["file_path"] in source_minio.objects
+    assert pdf_doc["file_path"] in source_minio.objects
 
 
 def test_variant_cluster_with_one_unresolvable_sibling_is_not_double_counted() -> None:

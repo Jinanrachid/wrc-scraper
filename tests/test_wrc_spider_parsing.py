@@ -93,7 +93,7 @@ def _seed_partition_state(
     are used alongside this, not replaced by it, where that adds confidence.
     """
     key = (body, partition.partition_date.isoformat())
-    spider._partition_state[key] = {
+    spider._tracker.partition_state[key] = {
         "records_found": 0,
         "records_scraped": 0,
         "records_failed": 0,
@@ -172,10 +172,10 @@ def test_parse_listing_wrc_extracts_expected_fields_and_follows_detail(
     assert "Jessica Davis" in first["description"]
     assert first["published_date_raw"] == "31/01/2024"
 
-    assert spider._partition_state[key]["records_found"] == 2
-    assert len(spider._partition_state[key]["pending"]) == 2
+    assert spider._tracker.partition_state[key]["records_found"] == 2
+    assert len(spider._tracker.partition_state[key]["pending"]) == 2
     # The listing banner ("...of 234 results") is captured as the authoritative total.
-    assert spider._partition_state[key]["records_expected"] == 234
+    assert spider._tracker.partition_state[key]["records_expected"] == 234
 
 
 def test_parse_listing_eat_import_identifier_is_the_business_reference(
@@ -217,8 +217,8 @@ def test_parse_listing_malformed_row_is_logged_and_skipped_not_followed(
     ]
 
     # 2 rows found, but only the well-formed one gets a follow request.
-    assert spider._partition_state[key]["records_found"] == 2
-    assert spider._partition_state[key]["records_failed"] == 1
+    assert spider._tracker.partition_state[key]["records_found"] == 2
+    assert spider._tracker.partition_state[key]["records_failed"] == 1
     assert len(follow_requests) == 1
     assert follow_requests[0].cb_kwargs["identifier"] == "ADJ-00047352"
 
@@ -241,8 +241,8 @@ def test_parse_listing_missing_refno_is_tolerated_since_identifier_is_h2_title(
         r for r in results if isinstance(r, Request) and r.callback == spider.parse_detail
     ]
 
-    assert spider._partition_state[key]["records_found"] == 2
-    assert spider._partition_state[key]["records_failed"] == 0
+    assert spider._tracker.partition_state[key]["records_found"] == 2
+    assert spider._tracker.partition_state[key]["records_failed"] == 0
     assert len(follow_requests) == 2
     assert follow_requests[0].cb_kwargs["identifier"] == "ADJ-00012345"
 
@@ -273,8 +273,8 @@ def test_parse_listing_missing_identifier_is_logged_and_skipped_not_followed(
         r for r in results if isinstance(r, Request) and r.callback == spider.parse_detail
     ]
 
-    assert spider._partition_state[key]["records_found"] == 1
-    assert spider._partition_state[key]["records_failed"] == 1
+    assert spider._tracker.partition_state[key]["records_found"] == 1
+    assert spider._tracker.partition_state[key]["records_failed"] == 1
     assert follow_requests == []
 
     failed = [e for e in _events_from(caplog) if e["event"] == "record_failed"]
@@ -297,14 +297,141 @@ def test_parse_listing_empty_page_completes_the_partition(
 
     assert results == []  # no rows, no next-page request
     # pagination_done + pending==0 (nothing was ever pending) -> partition completed and removed.
-    assert key not in spider._partition_state
-    assert spider._totals["partitions_completed"] == 1
+    assert key not in spider._tracker.partition_state
+    assert spider._tracker.totals["partitions_completed"] == 1
 
     events = _events_from(caplog)
     completed = [e for e in events if e["event"] == "partition_completed"]
     assert len(completed) == 1
     assert completed[0]["incomplete"] is False
     assert completed[0]["records_found"] == 0
+
+
+# -- pagination safeguards (docs/SCRAPY_EXPERIMENTS.md Sec 23) ----------------
+
+
+def _listing_page_html(identifiers: list[str], total: int | None) -> bytes:
+    """A minimal synthetic listing page: one row per identifier, and the
+    "Shows ... of N results" banner when ``total`` is given (omitted entirely
+    for the real "no search results" case, which uses listing_empty.html).
+    """
+    banner = f"<p>Shows 1 to {len(identifiers)} of {total} results</p>" if total is not None else ""
+    rows = "".join(
+        f"""<li class="each-item"><div class="row"><div class="col-sm-9">
+        <h2 class="title" title="{ident}"><a href="/en/cases/2024/january/{ident.lower()}.html"
+        title="{ident}">{ident}</a></h2>
+        </div><div class="col-sm-3"><span class="date">01/01/2024</span></div></div>
+        <div class="row bottom-ref"><span class="refNO">{ident}</span></div></li>"""
+        for ident in identifiers
+    )
+    html = f'<html><body><div class="search-results">{banner}<ul>{rows}</ul></div></body></html>'
+    return html.encode()
+
+
+def _listing_response(html: bytes, page_number: int, partition: DatePartition, body: str = "15376"):
+    url = f"https://www.workplacerelations.ie/en/search/?body={body}&pageNumber={page_number}"
+    request = Request(url, meta={"body": body, "partition": partition, "page_number": page_number})
+    return HtmlResponse(url=url, body=html, encoding="utf-8", request=request)
+
+
+def test_multipage_pagination_matching_expected_count_stays_complete(
+    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
+) -> None:
+    key = _seed_partition_state(spider, "15376", partition)
+    page1 = _listing_response(
+        _listing_page_html(["ADJ-1", "ADJ-2"], total=2), page_number=1, partition=partition
+    )
+    page2 = _listing_response(
+        (FIXTURES_DIR / "listing_empty.html").read_bytes(), page_number=2, partition=partition
+    )
+
+    with caplog.at_level(logging.INFO, logger="wrc.events"):
+        next_page_requests = [
+            r
+            for r in spider.parse_listing(page1)
+            if isinstance(r, Request) and r.callback == spider.parse_listing
+        ]
+        assert len(next_page_requests) == 1  # non-empty page -> pagination continues
+        list(spider.parse_listing(page2))
+
+    state = spider._tracker.partition_state[key]
+    assert state["records_expected"] == 2
+    assert state["records_found"] == 2
+    assert state["pagination_done"] is True
+    assert state["incomplete"] is False
+
+    mismatches = [e for e in _events_from(caplog) if e["event"] == "partition_count_mismatch"]
+    assert mismatches == []
+
+
+def test_records_expected_mismatch_marks_partition_incomplete(
+    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
+) -> None:
+    """docs/SCRAPY_EXPERIMENTS.md Sec 23 verified records_expected is a stable,
+    reliable total, so a mismatch against what was actually found means real
+    rows are unaccounted for and the partition cannot be trusted as complete.
+    """
+    key = _seed_partition_state(spider, "15376", partition)
+    # Banner claims 5, but only 3 rows are ever actually returned.
+    page1 = _listing_response(
+        _listing_page_html(["ADJ-1", "ADJ-2", "ADJ-3"], total=5), page_number=1, partition=partition
+    )
+    page2 = _listing_response(
+        (FIXTURES_DIR / "listing_empty.html").read_bytes(), page_number=2, partition=partition
+    )
+
+    with caplog.at_level(logging.INFO, logger="wrc.events"):
+        list(spider.parse_listing(page1))
+        list(spider.parse_listing(page2))
+
+    state = spider._tracker.partition_state[key]
+    assert state["records_expected"] == 5
+    assert state["records_found"] == 3
+    assert state["incomplete"] is True
+    assert "records_found (3)" in state["reason"]
+    assert "records_expected (5)" in state["reason"]
+
+    mismatches = [e for e in _events_from(caplog) if e["event"] == "partition_count_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0]["records_expected"] == 5
+    assert mismatches[0]["records_found"] == 3
+
+
+def test_max_pages_safety_limit_stops_pagination_and_marks_incomplete(
+    partition: DatePartition, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WRC_MAX_PAGES", "2")
+    spider = WrcSpider(start_date="2024-01-01", end_date="2024-01-31", bodies="15376")
+    key = _seed_partition_state(spider, "15376", partition)
+
+    page1 = _listing_response(
+        _listing_page_html(["ADJ-1"], total=None), page_number=1, partition=partition
+    )
+    page2 = _listing_response(
+        _listing_page_html(["ADJ-2"], total=None), page_number=2, partition=partition
+    )
+
+    with caplog.at_level(logging.INFO, logger="wrc.events"):
+        page1_results = list(spider.parse_listing(page1))
+        page2_results = list(spider.parse_listing(page2))
+
+    # Page 1 -> page 2 is still within the limit (WRC_MAX_PAGES=2).
+    assert any(isinstance(r, Request) and r.callback == spider.parse_listing for r in page1_results)
+    # Page 2 would continue to page 3, exceeding the limit -> pagination stops,
+    # only the row's own detail request is yielded, no further listing request.
+    assert not any(
+        isinstance(r, Request) and r.callback == spider.parse_listing for r in page2_results
+    )
+
+    state = spider._tracker.partition_state[key]
+    assert state["pagination_done"] is True
+    assert state["incomplete"] is True
+    assert "max page limit reached" in state["reason"]
+
+    events = [e for e in _events_from(caplog) if e["event"] == "partition_max_pages_reached"]
+    assert len(events) == 1
+    assert events[0]["max_pages"] == 2
+    assert events[0]["records_found"] == 2
 
 
 # -- detail parsing / document-type detection ----------------------------------
@@ -341,6 +468,40 @@ def test_parse_detail_wrc_inline_excludes_chrome_links_and_retains_raw_html(
     # Hardening item 3: raw HTML retained, unmodified, no re-fetch needed later.
     assert record.raw_html == fixture_text
     assert record.raw_binary is None
+
+
+def test_parse_detail_empty_html_inline_body_is_recorded_as_a_failure(
+    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Mirrors test_a_200_answer_with_an_empty_body_is_recorded_as_a_failure
+    (the binary-download path): a truncated/zero-byte 200 for a detail page
+    must not be counted as a successfully scraped record either.
+    """
+    _seed_partition_state(spider, "15376", partition)
+    url = "https://www.workplacerelations.ie/en/cases/2024/january/adj-00047352.html"
+    request = Request(url)
+    response = HtmlResponse(url=url, status=200, body=b"", request=request)
+
+    with caplog.at_level(logging.INFO, logger="wrc.events"):
+        items = list(
+            spider.parse_detail(
+                response,
+                body="15376",
+                partition=partition,
+                identifier="ADJ-00047352",
+                published_date_raw="31/01/2024",
+                description="Jessica Davis V St. Vincent's Private Hospital",
+            )
+        )
+
+    assert items == []  # no record yielded for an empty body
+    assert spider._tracker.totals["records_failed"] == 1
+    assert spider._tracker.totals["records_scraped"] == 0
+
+    failed = [e for e in _events_from(caplog) if e["event"] == "record_failed"]
+    assert len(failed) == 1
+    assert "empty" in failed[0]["reason"]
+    assert failed[0]["http_status"] == 200
 
 
 def test_parse_detail_eat_import_chains_binary_request_and_finds_real_pdf_link(
@@ -465,8 +626,8 @@ def test_detail_failed_errback_increments_records_failed_not_scraped(
 ) -> None:
     key = _seed_partition_state(spider, "15376", partition)
     detail_url = "https://www.workplacerelations.ie/en/cases/2024/january/adj-00000001.html"
-    spider._partition_state[key]["pending"] = {detail_url: "ADJ-00000001"}
-    spider._partition_state[key]["pagination_done"] = True
+    spider._tracker.partition_state[key]["pending"] = {detail_url: "ADJ-00000001"}
+    spider._tracker.partition_state[key]["pagination_done"] = True
 
     request = Request(
         detail_url,
@@ -478,11 +639,11 @@ def test_detail_failed_errback_increments_records_failed_not_scraped(
         spider._detail_failed(failure)
 
     assert (
-        key not in spider._partition_state
+        key not in spider._tracker.partition_state
     )  # partition completed after the only pending item resolved
-    assert spider._totals["records_failed"] == 1
-    assert spider._totals["records_scraped"] == 0
-    assert spider._totals["partitions_completed"] == 1
+    assert spider._tracker.totals["records_failed"] == 1
+    assert spider._tracker.totals["records_scraped"] == 0
+    assert spider._tracker.totals["partitions_completed"] == 1
 
     events = _events_from(caplog)
     failed = [e for e in events if e["event"] == "record_failed"]
@@ -524,123 +685,53 @@ def test_records_found_equals_scraped_plus_failed_for_a_completed_partition(
     )
     list(spider.parse_listing(empty_response))
 
-    assert key not in spider._partition_state
-    assert spider._totals["records_found"] == 2
-    assert spider._totals["records_scraped"] == 1
-    assert spider._totals["records_failed"] == 1
-    assert spider._totals["records_found"] == (
-        spider._totals["records_scraped"] + spider._totals["records_failed"]
+    assert key not in spider._tracker.partition_state
+    assert spider._tracker.totals["records_found"] == 2
+    assert spider._tracker.totals["records_scraped"] == 1
+    assert spider._tracker.totals["records_failed"] == 1
+    assert spider._tracker.totals["records_found"] == (
+        spider._tracker.totals["records_scraped"] + spider._tracker.totals["records_failed"]
     )
 
 
 # -- dangling partition reconciliation (hardening item 7) ----------------------
+#
+# The detailed accounting/logging behavior of reconciliation itself (every
+# pending record individually logged, records_unaccounted arithmetic, the
+# partition_completed/run_summary event content) is unit-tested directly and
+# thoroughly against PartitionTracker in test_partition_tracker.py. What's
+# worth proving here, at the spider level, is only the wiring: that
+# WrcSpider.closed() actually delegates to the tracker rather than, say,
+# skipping reconciliation on some shutdown path.
 
 
-def test_closed_reconciles_dangling_partition_state_and_logs_each_pending_record(
-    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
+def test_closed_delegates_to_the_tracker_for_reconciliation_and_run_summary(
+    spider: WrcSpider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If the spider is shut down (item cap, kill, crash, unexpected exception)
-    before every in-flight request resolves, the partition must not silently
-    vanish -- and per assessment req #10/tip, EVERY un-scraped record must be
-    individually logged with a reason, not just an aggregate partition note.
-    """
-    key = _seed_partition_state(spider, "15376", partition)
-    spider._partition_state[key]["pagination_done"] = True
-    # Two unresolved requests -- simulates a hard shutdown mid-flight.
-    spider._partition_state[key]["pending"] = {
-        "https://www.workplacerelations.ie/en/cases/2024/january/adj-1.html": "ADJ-1",
-        "https://www.workplacerelations.ie/en/cases/2024/january/adj-2.html": "ADJ-2",
-    }
-    spider._partition_state[key]["records_found"] = 2
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        spider._tracker, "reconcile_dangling", lambda: calls.append(("reconcile_dangling", ()))
+    )
+    monkeypatch.setattr(
+        spider._tracker,
+        "log_run_summary",
+        lambda reason: calls.append(("log_run_summary", (reason,))),
+    )
 
-    with caplog.at_level(logging.INFO, logger="wrc.events"):
-        spider.closed("finished")
+    spider.closed("finished")
 
-    assert spider._partition_state == {}
-    assert spider._totals["partitions_incomplete"] == 1
-    assert spider._totals["records_failed"] == 2  # both dangling records counted
-
-    events = _events_from(caplog)
-
-    # Every dangling record gets its own record_failed -- not folded away.
-    failed = [e for e in events if e["event"] == "record_failed"]
-    assert len(failed) == 2
-    assert {e["identifier"] for e in failed} == {"ADJ-1", "ADJ-2"}
-    assert {e["url"] for e in failed} == {
-        "https://www.workplacerelations.ie/en/cases/2024/january/adj-1.html",
-        "https://www.workplacerelations.ie/en/cases/2024/january/adj-2.html",
-    }
-    assert all("resolved" in e["reason"] for e in failed)
-
-    completed = [e for e in events if e["event"] == "partition_completed"]
-    assert len(completed) == 1
-    assert completed[0]["incomplete"] is True
-    assert completed[0]["records_failed"] == 2
-    assert "pending" in completed[0]["reason"]
-
-    summary = [e for e in events if e["event"] == "run_summary"]
-    assert len(summary) == 1
-    assert summary[0]["partitions_incomplete"] == 1
-    assert summary[0]["records_failed"] == 2
+    assert calls == [("reconcile_dangling", ()), ("log_run_summary", ("finished",))]
 
 
-def test_partition_reports_unaccounted_records_when_a_listing_page_failed(
-    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
-) -> None:
-    """When a listing page fails mid-pagination, the rows behind it were never
-    fetched, so their identifiers can't be logged individually. Req #10 is still
-    served by quantifying the shortfall: the site said N, we scraped S, so
-    records_unaccounted = N - S - F is reported with the partition-level reason.
-    """
-    key = _seed_partition_state(spider, "15376", partition)
-    state = spider._partition_state[key]
-    state["records_expected"] = 30  # the site's banner said 30
-    state["records_found"] = 20  # only pages 1-2 were seen before page 3 failed
-    state["records_scraped"] = 20
-    state["records_failed"] = 0
-    state["pagination_done"] = True  # stopped because a page failed
-    state["incomplete"] = True
-    state["reason"] = "listing page failed: DownloadTimeoutError(...)"
-
-    with caplog.at_level(logging.INFO, logger="wrc.events"):
-        spider._maybe_complete_partition("15376", partition)
-        spider.closed("finished")
-
-    events = _events_from(caplog)
-    completed = [e for e in events if e["event"] == "partition_completed"]
-    assert len(completed) == 1
-    assert completed[0]["records_expected"] == 30
-    assert completed[0]["records_unaccounted"] == 10  # 30 - (20 scraped + 0 failed)
-    assert completed[0]["incomplete"] is True
-    assert "listing page failed" in completed[0]["reason"]
-
-    summary = [e for e in events if e["event"] == "run_summary"]
-    assert summary[0]["records_unaccounted"] == 10
-
-
-def test_fully_scraped_partition_reports_zero_unaccounted(
-    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A partition that completes normally (all pages fetched) has expected ==
-    scraped + failed, so records_unaccounted is 0 -- no false shortfall.
-    """
-    key = _seed_partition_state(spider, "15376", partition)
-    state = spider._partition_state[key]
-    state["records_expected"] = 20
-    state["records_found"] = 20
-    state["records_scraped"] = 18
-    state["records_failed"] = 2
-    state["pagination_done"] = True
-
-    with caplog.at_level(logging.INFO, logger="wrc.events"):
-        spider._maybe_complete_partition("15376", partition)
-
-    completed = [e for e in _events_from(caplog) if e["event"] == "partition_completed"]
-    assert completed[0]["records_unaccounted"] == 0
-    assert completed[0]["incomplete"] is False
-
-
-# -- conditional GET for binary documents (assessment requirement #9) ----------
+# -- chained binary request / 304 handling (assessment requirement #9) --------
+#
+# Header injection itself (If-None-Match, when it is/isn't sent, the
+# once-per-run "unavailable" log) is ConditionalGetMiddleware's job now --
+# see tests/test_middlewares.py. What's tested here is what stays in the
+# spider: the chained request exposes exactly the meta the middleware needs,
+# and parse_document_binary's own interpretation of a 304 vs. a 200 response
+# (which only ever reads `request.meta.get("conditional_etag")`, wherever
+# that came from).
 
 
 EAT_STUB_URL = (
@@ -664,46 +755,26 @@ def _binary_request(spider: WrcSpider, partition: DatePartition) -> Request:
     return results[0]
 
 
-def _advisor_returning(etag: str | None) -> object:
-    class StubAdvisor:
-        last_error = None
-
-        def etag_for(self, body: str, detail_url: str, document_type: str) -> str | None:
-            assert document_type == "pdf"  # html is never made conditional
-            return etag
-
-    return StubAdvisor()
-
-
-def test_binary_request_is_unconditional_when_nothing_is_stored_yet(
+def test_binary_request_carries_the_meta_the_conditional_get_middleware_needs(
     spider: WrcSpider, partition: DatePartition
 ) -> None:
-    spider._conditional_get = _advisor_returning(None)
-
     request = _binary_request(spider, partition)
 
+    assert request.meta["body"] == "2"
+    assert request.meta["detail_url"] == EAT_STUB_URL
+    assert request.meta["document_type"] == "pdf"
+    # The spider itself no longer decides this -- no header/meta is set here.
     assert b"If-None-Match" not in request.headers
     assert "handle_httpstatus_list" not in request.meta
-
-
-def test_binary_request_sends_the_unquoted_etag_and_accepts_a_304(
-    spider: WrcSpider, partition: DatePartition
-) -> None:
-    spider._conditional_get = _advisor_returning("635084654748830000")
-
-    request = _binary_request(spider, partition)
-
-    # Unquoted -- the only form this site answers 304 to (Sec 20).
-    assert request.headers[b"If-None-Match"] == b"635084654748830000"
-    # Without this Scrapy's HttpError middleware would drop the 304 as an error.
-    assert request.meta["handle_httpstatus_list"] == [304]
 
 
 def test_304_yields_a_record_with_no_bytes_and_counts_a_skipped_download(
     spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
 ) -> None:
-    spider._conditional_get = _advisor_returning("635084654748830000")
     request = _binary_request(spider, partition)
+    # What ConditionalGetMiddleware would have set on the outgoing request
+    # before the site answered 304.
+    request.meta["conditional_etag"] = "635084654748830000"
 
     with caplog.at_level(logging.INFO, logger="wrc.events"):
         not_modified = HtmlResponse(url=request.url, status=304, body=b"", request=request)
@@ -717,8 +788,8 @@ def test_304_yields_a_record_with_no_bytes_and_counts_a_skipped_download(
     assert record.document_type == "pdf"
     assert record.identifier == "38086"  # metadata is still refreshed
 
-    assert spider._totals["documents_not_modified"] == 1
-    assert spider._totals["records_scraped"] == 1  # a skip is a success, not a failure
+    assert spider._tracker.totals["documents_not_modified"] == 1
+    assert spider._tracker.totals["records_scraped"] == 1  # a skip is a success, not a failure
     events = [json.loads(r.message) for r in caplog.records]
     assert any(e["event"] == "document_not_modified" for e in events)
 
@@ -730,8 +801,8 @@ def test_a_200_answer_to_a_conditional_request_falls_back_to_the_full_download(
     ignores If-None-Match and answers 200, the record must carry real bytes
     and go through the normal SHA-256 comparison.
     """
-    spider._conditional_get = _advisor_returning("635084654748830000")
     request = _binary_request(spider, partition)
+    request.meta["conditional_etag"] = "635084654748830000"
 
     response = HtmlResponse(
         url=request.url,
@@ -745,25 +816,104 @@ def test_a_200_answer_to_a_conditional_request_falls_back_to_the_full_download(
     assert record.not_modified is False
     assert record.raw_binary == b"%PDF-1.4 fake pdf bytes"
     assert record.remote_etag == '"new-etag"'
-    assert spider._totals["documents_not_modified"] == 0
+    assert spider._tracker.totals["documents_not_modified"] == 0
 
 
-def test_an_unreachable_advisor_is_reported_once_and_leaves_the_crawl_unconditional(
-    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
+# -- per-row exception isolation in parse_listing (robustness pass, Fix 1) -----
+
+
+def test_parse_listing_unexpected_row_error_is_isolated_and_page_continues(
+    spider: WrcSpider,
+    partition: DatePartition,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class BrokenAdvisor:
-        last_error = "ConnectionError('mongo is down')"
+    """A novel, unexpected surprise while building ONE row's detail request
+    must not abort the rest of the page. Rows 1 and 3 still get detail
+    requests, the middle row is logged as record_failed with the exception
+    repr as its reason, and pagination still continues to the next page.
+    """
+    key = _seed_partition_state(spider, "15376", partition)
+    html = b"""<html><body><ul>
+      <li class="each-item"><div class="row"><div class="col-sm-9">
+        <h2 class="title" title="ADJ-1"><a href="/en/cases/2024/january/adj-1.html">ADJ-1</a></h2>
+        <p class="description" title="Row one">Row one</p>
+      </div><div class="col-sm-3"><span class="date">01/01/2024</span></div></div></li>
+      <li class="each-item"><div class="row"><div class="col-sm-9">
+        <h2 class="title" title="ADJ-2"><a href="/en/cases/2024/january/adj-2.html">ADJ-2</a></h2>
+        <p class="description" title="Row two">Row two</p>
+      </div><div class="col-sm-3"><span class="date">01/01/2024</span></div></div></li>
+      <li class="each-item"><div class="row"><div class="col-sm-9">
+        <h2 class="title" title="ADJ-3"><a href="/en/cases/2024/january/adj-3.html">ADJ-3</a></h2>
+        <p class="description" title="Row three">Row three</p>
+      </div><div class="col-sm-3"><span class="date">01/01/2024</span></div></div></li>
+    </ul></body></html>"""
+    request = Request(
+        "https://www.workplacerelations.ie/en/search/?body=15376",
+        meta={"body": "15376", "partition": partition, "page_number": 1},
+    )
+    response = HtmlResponse(url=request.url, body=html, encoding="utf-8", request=request)
 
-        def etag_for(self, body: str, detail_url: str, document_type: str) -> str | None:
-            return None
+    # Raise only on the 2nd row's mark_pending call, leaving rows 1 and 3 fine.
+    original_mark_pending = spider._tracker.mark_pending
+    calls = {"n": 0}
 
-    spider._conditional_get = BrokenAdvisor()
+    def flaky_mark_pending(*args: object, **kwargs: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("unexpected selector surprise")
+        return original_mark_pending(*args, **kwargs)
+
+    monkeypatch.setattr(spider._tracker, "mark_pending", flaky_mark_pending)
 
     with caplog.at_level(logging.INFO, logger="wrc.events"):
-        request = _binary_request(spider, partition)
-        spider._conditional_etag("2", EAT_STUB_URL, "pdf")  # a second document
+        results = list(spider.parse_listing(response))
 
-    assert b"If-None-Match" not in request.headers
-    events = [json.loads(r.message) for r in caplog.records]
-    unavailable = [e for e in events if e["event"] == "conditional_get_unavailable"]
-    assert len(unavailable) == 1  # logged once, not per request
+    follow_requests = [
+        r for r in results if isinstance(r, Request) and r.callback == spider.parse_detail
+    ]
+    next_page_requests = [
+        r for r in results if isinstance(r, Request) and r.callback == spider.parse_listing
+    ]
+
+    # Rows 1 and 3 survived; only the middle row was dropped.
+    assert [r.cb_kwargs["identifier"] for r in follow_requests] == ["ADJ-1", "ADJ-3"]
+    # Pagination continuation is still emitted despite the mid-page error.
+    assert len(next_page_requests) == 1
+
+    assert spider._tracker.partition_state[key]["records_found"] == 3
+    assert spider._tracker.partition_state[key]["records_failed"] == 1
+    # Only the two surviving rows were marked pending (the failed row was not).
+    assert len(spider._tracker.partition_state[key]["pending"]) == 2
+
+    failed = [e for e in _events_from(caplog) if e["event"] == "record_failed"]
+    assert len(failed) == 1
+    assert failed[0]["reason"] == "RuntimeError('unexpected selector surprise')"
+    assert failed[0]["listing_url"] == response.url
+
+
+# -- empty-body validation in parse_document_binary (robustness pass, Fix 2) ---
+
+
+def test_a_200_answer_with_an_empty_body_is_recorded_as_a_failure(
+    spider: WrcSpider, partition: DatePartition, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-304 response with a zero-length body is not a successful fetch:
+    it must be an explicit, logged failure (http_status 200, "empty" reason,
+    records_failed incremented) -- never a silently stored 0-byte document.
+    """
+    request = _binary_request(spider, partition)
+
+    with caplog.at_level(logging.INFO, logger="wrc.events"):
+        response = HtmlResponse(url=request.url, status=200, body=b"", request=request)
+        items = list(spider.parse_document_binary(response, **request.cb_kwargs))
+
+    assert items == []  # no record yielded for an empty body
+    assert spider._tracker.totals["records_failed"] == 1
+    assert spider._tracker.totals["records_scraped"] == 0
+    assert spider._tracker.totals["documents_not_modified"] == 0
+
+    failed = [e for e in _events_from(caplog) if e["event"] == "record_failed"]
+    assert len(failed) == 1
+    assert "empty" in failed[0]["reason"]
+    assert failed[0]["http_status"] == 200

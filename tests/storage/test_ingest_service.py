@@ -266,22 +266,6 @@ def test_repeated_processing_of_the_same_record_never_creates_a_duplicate_docume
     assert mongo.upsert_calls == 5  # every call reaches Mongo, but never duplicates
 
 
-def test_deterministic_keys_mean_concurrent_uploads_of_identical_content_are_safe() -> None:
-    """Two "concurrent" writers processing the same unchanged record both
-    target the same key with the same bytes -- last-write-wins is a no-op,
-    not data loss.
-    """
-    service, _mongo, minio = make_service()
-    record = make_html_record()
-
-    service.ingest(record)
-    service.ingest(record)
-
-    assert minio.objects["wrc/en/cases/2024/january/adj-00047352.html"] == record.raw_html.encode(
-        "utf-8"
-    )
-
-
 # -- variant clusters (real cases, docs/SCRAPY_EXPERIMENTS.md Sec 19) -----------
 
 

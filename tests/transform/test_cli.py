@@ -53,3 +53,28 @@ def test_invalid_date_format_fails_clearly_with_usage_exit_code(
 
     assert exit_code == 2
     assert any("invalid_arguments" in message for _level, message in recording_logger.records)
+
+
+def test_client_construction_failure_is_logged_with_date_range_context(
+    recording_logger: _RecordingLogger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Mongo/MinIO client-construction error happens before
+    `TransformService` even exists -- it must still be caught, logged with
+    the run's date range, and exit with the run-failure code, not propagate
+    as a bare traceback.
+    """
+
+    def _broken_build_mongo(settings):
+        raise ConnectionError("mongo unreachable at construction")
+
+    monkeypatch.setattr(cli, "build_mongo", _broken_build_mongo)
+
+    exit_code = cli.main(["--start-date", "2024-01-01", "--end-date", "2024-01-31"])
+
+    assert exit_code == 3
+    (run_failed_message,) = (
+        message for _level, message in recording_logger.records if "run_failed" in message
+    )
+    assert "mongo unreachable at construction" in run_failed_message
+    assert "2024-01-01" in run_failed_message
+    assert "2024-01-31" in run_failed_message
