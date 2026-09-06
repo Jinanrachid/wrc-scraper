@@ -1,4 +1,4 @@
-"""SHA-256 content hashing (Phase 3, Decisions 3/6).
+"""SHA-256 content hashing.
 
 PDF/DOC/DOCX: raw bytes, unmodified -- no volatility evidence exists (static
 IIS-served files; docs/SCRAPY_EXPERIMENTS.md Sec 18).

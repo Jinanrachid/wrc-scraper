@@ -1,10 +1,10 @@
-"""Idempotent ingest state machine (Phase 3, Decisions 6/7/8).
+"""Idempotent ingest state machine.
 
 Framework-agnostic: depends only on the small Protocols below (MongoPort,
 MinioPort), never on Scrapy, pymongo, or the minio client directly -- so it's
 fully unit-testable against hand-rolled in-memory fakes, no Docker required.
 
-Governing rule (Decision 8): MinIO is written *before* Mongo is ever marked
+Governing rule: MinIO is written *before* Mongo is ever marked
 "stored". A crash between the two leaves an orphaned MinIO object (harmless,
 reconcilable) rather than a Mongo record pointing at nothing -- never the
 reverse. Deterministic keys make a blind retry after any failure safe (PUT to
@@ -161,8 +161,9 @@ class IngestService:
             )
         except Exception as exc:  # noqa: BLE001
             # MinIO write already succeeded -- the object is *not* orphaned by
-            # accident, it's an accepted, recoverable side effect (Decision 8).
-            # Mongo is left at "pending" (from upsert_pending above) rather
+            # accident, it's an accepted, recoverable side effect of the
+            # MinIO-before-Mongo governing rule above. Mongo is left at
+            # "pending" (from upsert_pending above) rather
             # than "stored", so a rerun retries the confirmation safely.
             return IngestOutcome(doc_id, "failed", content_changed, repr(exc), variant_cluster)
 

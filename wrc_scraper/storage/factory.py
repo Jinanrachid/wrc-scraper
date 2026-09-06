@@ -81,7 +81,7 @@ def build_minio(settings: StorageSettings) -> MinioRepository:
 def build_transformed_mongo(
     settings: StorageSettings, transform: TransformSettings
 ) -> tuple[Any, MongoRepository]:
-    """Return (client, repository) for the Phase 4 transformed-metadata
+    """Return (client, repository) for the transformed-metadata
     collection -- the same Mongo cluster/database as the Landing Zone, a
     different collection (`transform.mongo_transformed_collection`). Same
     `MongoRepository` class as the landing side (CLAUDE.md: don't fork the
@@ -96,7 +96,7 @@ def build_transformed_mongo(
 def build_transformed_minio(
     settings: StorageSettings, transform: TransformSettings
 ) -> MinioRepository:
-    """Return a repository for the Phase 4 transformed-documents bucket -- the
+    """Return a repository for the transformed-documents bucket -- the
     same MinIO endpoint/credentials, a different bucket
     (`transform.minio_transformed_bucket`).
     """

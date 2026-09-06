@@ -1,4 +1,4 @@
-"""Thin MinIO client wrapper (Phase 3, Decision 3).
+"""Thin MinIO client wrapper.
 
 Deliberately thin, mirroring mongo_repository.py: one method per operation,
 no business logic. IngestService depends on this class's public interface

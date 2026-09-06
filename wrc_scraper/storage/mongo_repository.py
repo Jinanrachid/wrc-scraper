@@ -1,4 +1,4 @@
-"""Thin pymongo wrapper (Phase 3, Decisions 1/2).
+"""Thin pymongo wrapper.
 
 Deliberately thin: every method maps to one MongoDB operation. The actual
 idempotency *decisions* live in IngestService, which depends only on this
@@ -23,6 +23,12 @@ class MongoRepository:
         # identifier, and the transformation stage groups by exactly this to
         # pick a canonical copy.
         self._collection.create_index([("body_slug", 1), ("identifier", 1)])
+        # Covers find_stored's query shape when called with no body_slug (the
+        # wrc-transform CLI's default: whole date range, all bodies) -- none of
+        # the body_slug-prefixed indexes above serve that filter, so without
+        # this it's a collection scan. Dagster's own processed_documents always
+        # supplies body_slug and hits the compound index instead.
+        self._collection.create_index([("status", 1), ("partition_date", 1)])
 
     def get(self, doc_id: str) -> dict | None:
         return self._collection.find_one({"_id": doc_id})
@@ -30,15 +36,27 @@ class MongoRepository:
     def count_by_identifier(self, body_slug: str, identifier: str) -> int:
         return self._collection.count_documents({"body_slug": body_slug, "identifier": identifier})
 
-    def find_stored(self, start_date: str, end_date: str) -> list[dict]:
+    def find_stored(
+        self, start_date: str, end_date: str, *, body_slug: str | None = None
+    ) -> list[dict]:
         """Every `status == "stored"` record whose `partition_date` falls in
         `[start_date, end_date]` (inclusive, ISO `YYYY-MM-DD`) -- the landing
         query the transformation stage runs over. Sorted deterministically so
         repeated runs group `(body_slug, identifier)` clusters the same way.
+
+        `body_slug`, when given, scopes the query to one deciding body -- used
+        by the Dagster `processed_documents` asset, which is partitioned on
+        `(month, body_slug)` and must only touch its own partition's slice.
         """
-        cursor = self._collection.find(
-            {"status": "stored", "partition_date": {"$gte": start_date, "$lte": end_date}}
-        ).sort([("body_slug", 1), ("identifier", 1), ("detail_url", 1)])
+        query: dict[str, object] = {
+            "status": "stored",
+            "partition_date": {"$gte": start_date, "$lte": end_date},
+        }
+        if body_slug is not None:
+            query["body_slug"] = body_slug
+        cursor = self._collection.find(query).sort(
+            [("body_slug", 1), ("identifier", 1), ("detail_url", 1)]
+        )
         return list(cursor)
 
     def find_stored_by_identifier(self, body_slug: str, identifier: str) -> list[dict]:
@@ -53,7 +71,7 @@ class MongoRepository:
         return list(cursor)
 
     def upsert_pending(self, doc_id: str, *, now: str, **fields: Any) -> dict:
-        """Atomic create-if-absent (Decision 2/8) -- concurrent callers race
+        """Atomic create-if-absent -- concurrent callers race
         safely on MongoDB's own `_id` uniqueness; only one insert wins, the
         rest just update. Always refreshes the descriptive metadata fields
         (identifier/description/etc.) even on an existing doc, since those can
@@ -119,13 +137,28 @@ class MongoRepository:
             update["remote_etag"] = remote_etag
         self._collection.update_one({"_id": doc_id}, {"$set": update})
 
-    def mark_failed(self, doc_id: str, *, stage: str, reason: str, now: str) -> None:
+    def mark_failed(
+        self,
+        doc_id: str,
+        *,
+        stage: str,
+        reason: str,
+        now: str,
+        candidate_errors: list[dict] | None = None,
+    ) -> None:
+        error: dict[str, object] = {
+            "stage": stage,
+            "reason": reason,
+            "occurred_at": now,
+        }
+        if candidate_errors:
+            error["candidate_errors"] = candidate_errors
         self._collection.update_one(
             {"_id": doc_id},
             {
                 "$set": {
                     "status": "failed",
-                    "error": {"stage": stage, "reason": reason, "occurred_at": now},
+                    "error": error,
                     "last_checked_at": now,
                 }
             },

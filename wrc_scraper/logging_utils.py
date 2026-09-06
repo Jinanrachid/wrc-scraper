@@ -1,4 +1,4 @@
-"""Dedicated logger for structured JSON events (Phase 2 hardening item 6).
+"""Dedicated logger for structured JSON events.
 
 `self.logger.info(json.dumps(...))` on a Scrapy spider logger still goes through
 Scrapy's default formatter, which prefixes every line with a timestamp/level/name
@@ -16,8 +16,9 @@ is set, events are additionally written there as JSON lines (otherwise stdout).
 from __future__ import annotations
 
 import logging
-import os
 import sys
+
+from wrc_scraper.config import env_optional_str, env_str
 
 EVENTS_LOGGER_NAME = "wrc.events"
 
@@ -27,7 +28,7 @@ def get_events_logger() -> logging.Logger:
     logger = logging.getLogger(EVENTS_LOGGER_NAME)
     if not logger.handlers:
         formatter = logging.Formatter("%(message)s")
-        log_file = os.environ.get("WRC_EVENTS_LOG_FILE")
+        log_file = env_optional_str("WRC_EVENTS_LOG_FILE")
         handler: logging.Handler = (
             logging.FileHandler(log_file, encoding="utf-8")
             if log_file
@@ -35,6 +36,6 @@ def get_events_logger() -> logging.Logger:
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-        logger.setLevel(os.environ.get("WRC_LOG_LEVEL", "INFO").upper())
+        logger.setLevel(env_str("WRC_LOG_LEVEL", "INFO").upper())
         logger.propagate = False
     return logger
