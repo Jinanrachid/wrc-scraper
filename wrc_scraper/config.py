@@ -32,6 +32,15 @@ def env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def env_optional_str(name: str) -> str | None:
+    """Like ``env_str``, but for values with no meaningful default (e.g. an
+    optional output path where "unset" means "use stdout instead"). Kept here
+    rather than inline ``os.environ.get`` calls so every env read -- including
+    optional ones -- goes through this single, documented module.
+    """
+    return os.environ.get(name)
+
+
 def env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -112,6 +121,12 @@ class PartitionSettings:
 DEFAULT_SEARCH_URL = "https://www.workplacerelations.ie/en/search/"
 DEFAULT_USER_AGENT = "wrc_scraper (Kedra coding assessment; contact: jinanrachid@gmail.com)"
 DEFAULT_RETRY_HTTP_CODES = [429, 500, 502, 503, 504, 408, 522, 524]
+# Pin the reactor explicitly instead of inheriting Scrapy's version-dependent
+# default. This is the asyncio-backed Twisted reactor (Scrapy's own default since
+# 2.7 and on the installed 2.18), locked here so an unattended production run
+# behaves identically regardless of the Scrapy version present -- and so any
+# async/await usage in spiders/middleware keeps a supported event loop.
+DEFAULT_TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,6 +136,8 @@ class ScrapingSettings:
     allowed_domains: list[str]
     user_agent: str
     robotstxt_obey: bool
+    # event loop / reactor (pinned; see DEFAULT_TWISTED_REACTOR)
+    twisted_reactor: str
     # concurrency / throttle. Ramp in docs/SCRAPY_EXPERIMENTS.md Sec 15 found 24
     # optimal under good latency; the default was revised down to 16 with a 60s
     # timeout (Sec 21) after a live run showed 24/30 producing timeout noise when
@@ -138,6 +155,13 @@ class ScrapingSettings:
     retry_http_codes: list[int]
     download_timeout: int
     download_maxsize: int
+    # pagination safety ceiling. docs/SCRAPY_EXPERIMENTS.md Sec 23 verified
+    # pageNumber is respected and records_expected is a reliable total -- the
+    # largest observed real partition (WRC, Jan 2024, 234 records) needed 24
+    # pages, so this is a high ceiling that should never bind on a real WRC
+    # partition, only guard against a runaway loop if site behavior ever
+    # changes.
+    max_pages: int
     # misc hardening
     cookies_enabled: bool
     telnetconsole_enabled: bool
@@ -159,6 +183,7 @@ class ScrapingSettings:
             allowed_domains=allowed_domains,
             user_agent=env_str("WRC_USER_AGENT", DEFAULT_USER_AGENT),
             robotstxt_obey=env_bool("WRC_ROBOTSTXT_OBEY", False),
+            twisted_reactor=env_str("WRC_TWISTED_REACTOR", DEFAULT_TWISTED_REACTOR),
             concurrent_requests=concurrent_requests,
             # Single-domain crawl: default the per-domain cap equal to the global
             # one, else Scrapy's default (8) would silently bind below it.
@@ -179,6 +204,7 @@ class ScrapingSettings:
             retry_http_codes=env_int_list("WRC_RETRY_HTTP_CODES", DEFAULT_RETRY_HTTP_CODES),
             download_timeout=env_int("WRC_DOWNLOAD_TIMEOUT", 60),
             download_maxsize=env_int("WRC_DOWNLOAD_MAXSIZE", 50 * 1024 * 1024),
+            max_pages=env_int("WRC_MAX_PAGES", 500),
             cookies_enabled=env_bool("WRC_COOKIES_ENABLED", False),
             telnetconsole_enabled=env_bool("WRC_TELNETCONSOLE_ENABLED", False),
             conditional_get_enabled=env_bool("WRC_CONDITIONAL_GET", True),
@@ -186,7 +212,7 @@ class ScrapingSettings:
         )
 
 
-# -- transformation (Phase 4) --------------------------------------------------
+# -- transformation ------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True)
@@ -220,4 +246,46 @@ class TransformSettings:
             # for concurrent use from multiple threads. 1 disables the pool
             # entirely (fully sequential), matching the original behavior.
             concurrency=env_int("WRC_TRANSFORM_CONCURRENCY", 8),
+        )
+
+
+# -- orchestration ---------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class OrchestrationSettings:
+    ingest_failed_ratio_threshold: float
+    transform_failed_ratio_threshold: float
+    retry_max: int
+    retry_delay_seconds: float
+    scrapy_subprocess_timeout_seconds: float
+
+    @classmethod
+    def from_env(cls) -> OrchestrationSettings:
+        return cls(
+            # Asset-check thresholds (Dagster `landing_documents`/`processed_documents`
+            # quality checks): the fraction of found/found-equivalent records that may
+            # fail before the check flags the partition, on top of (not instead of) the
+            # hard failure raised for a systemic crawl/transform error.
+            ingest_failed_ratio_threshold=env_float("WRC_INGEST_FAILED_RATIO_THRESHOLD", 0.05),
+            transform_failed_ratio_threshold=env_float(
+                "WRC_TRANSFORM_FAILED_RATIO_THRESHOLD", 0.05
+            ),
+            # Partition-level RetryPolicy (retry layer 2 -- see ARCHITECTURE.md).
+            # Read once at asset-definition import time, so tests can drop these
+            # to 0 to exercise a failure path without waiting through a real
+            # backoff delay.
+            retry_max=env_int("WRC_ORCHESTRATION_RETRY_MAX", 3),
+            retry_delay_seconds=env_float("WRC_ORCHESTRATION_RETRY_DELAY_SECONDS", 30.0),
+            # Bounds the `scrapy crawl` subprocess itself (scrapy_runner.py), on
+            # top of -- not instead of -- Scrapy's own per-request
+            # DOWNLOAD_TIMEOUT/RETRY_TIMES. Those only bound individual HTTP
+            # requests; nothing else bounds the process, so a reactor deadlock
+            # or a hang before any per-request timeout applies would otherwise
+            # block a Dagster run/step slot forever. Generous default: one
+            # (month, body) partition's full crawl should never legitimately
+            # approach an hour at this project's scale.
+            scrapy_subprocess_timeout_seconds=env_float(
+                "WRC_SCRAPY_SUBPROCESS_TIMEOUT_SECONDS", 3600.0
+            ),
         )

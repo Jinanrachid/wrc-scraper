@@ -1,4 +1,4 @@
-"""Phase 4: transformation of Landing Zone documents into the transformed store.
+"""Transformation of Landing Zone documents into the transformed store.
 
 `html_cleaner.py` holds the BeautifulSoup content extraction, kept independent
 of storage/orchestration so it is testable against plain HTML strings.

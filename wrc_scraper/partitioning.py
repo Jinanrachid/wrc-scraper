@@ -1,9 +1,9 @@
 """Date-range partitioning for the WRC crawl.
 
-Generic by design (Phase 2 plan, Decision 4 / Step 2.1): the granularity that
-performs best (monthly, biweekly, weekly, or something else) is an open
-question the Step 2.0 experiments answer, not something this module should
-bake in. It supports whichever granularity is chosen, as configuration.
+Generic by design: the granularity that performs best (monthly, biweekly,
+weekly, or something else) is an open question the experiments in
+docs/SCRAPY_EXPERIMENTS.md answer, not something this module should bake in.
+It supports whichever granularity is chosen, as configuration.
 """
 
 from __future__ import annotations
@@ -73,5 +73,5 @@ def iter_date_partitions(
 
 
 def format_site_date(d: date) -> str:
-    """Convert a date to the WRC site's DD/MM/YYYY query format (verified Phase 1)."""
+    """Convert a date to the WRC site's DD/MM/YYYY query format (verified live)."""
     return d.strftime("%d/%m/%Y")
