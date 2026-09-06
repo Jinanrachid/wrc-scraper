@@ -1,10 +1,19 @@
-# Local MongoDB + MinIO for development/testing.
+# Local MongoDB + MinIO for development/testing, plus an optional `app`
+# service that runs the Dagster orchestration (`landing_documents` /
+# `processed_documents`) inside a container, built from the project's own
+# Dockerfile.
 #
 # All credentials and ports are read from the environment (Compose auto-loads a
 # `.env` file in this directory) with sensible defaults, so infra and the app
 # share a single source of truth -- no hardcoded values. The same WRC_MINIO_*
 # credentials configured here are what the pipeline uses to connect (see
 # wrc_scraper/config.py and .env.example).
+#
+# `mongo`/`minio` are unchanged from before `app` was added. Running only
+# `docker compose up -d mongo minio` (or `docker compose up -d` and ignoring
+# `app`) still supports the original workflow of running Dagster/Scrapy from
+# the host against these two services -- `app` is additive, not a
+# replacement.
 services:
   mongo:
     image: ${WRC_MONGO_IMAGE:-mongo:7}
@@ -18,6 +27,29 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # Optional, opt-in web UI for browsing the Mongo metadata collections
+  # (landing_metadata / transformed_metadata) -- the Mongo equivalent of the
+  # MinIO console. NOT started by default: it belongs to the "tools" profile,
+  # so a plain `docker compose up -d` never runs it. Start it explicitly with:
+  #   docker compose --profile tools up -d mongo-express   # UI at :8081
+  # Points at the no-auth `mongo` service by name (matching the app's own
+  # credential-free WRC_MONGO_URI contract). The basic-auth below only guards
+  # the UI itself; override via .env for anything beyond local use.
+  mongo-express:
+    image: mongo-express:1.0.2
+    profiles: ["tools"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "${WRC_MONGO_EXPRESS_PORT:-8081}:8081"
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://mongo:27017/
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+      ME_CONFIG_BASICAUTH_USERNAME: ${WRC_MONGO_EXPRESS_USER:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${WRC_MONGO_EXPRESS_PASSWORD:-admin}
+    restart: unless-stopped
 
   minio:
     # Pinned to a specific release for reproducibility (not :latest). This is the
@@ -40,6 +72,69 @@ services:
       timeout: 5s
       retries: 10
 
+  # The application container: runs the Dagster webserver + daemon
+  # (`workspace.yaml` -> `wrc_scraper.orchestration.definitions`) by default,
+  # which itself invokes `scrapy crawl wrc` as a subprocess and
+  # `TransformService` in-process for its two assets -- the same architecture
+  # as running `dagster dev` from the host, just containerized. For an
+  # ad-hoc crawl or transform run instead of the Dagster UI, override the
+  # command, e.g.:
+  #   docker compose run --rm app scrapy crawl wrc -a start_date=2024-01-01 -a end_date=2024-01-31
+  #   docker compose run --rm app wrc-transform --start-date 2024-01-01 --end-date 2024-01-31
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      mongo:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${WRC_DAGSTER_UI_PORT:-3000}:3000"
+    # Load all WRC_* configuration from a local .env (12-factor: config comes
+    # from the environment, not the image). Optional -- absent .env just uses
+    # the code defaults. `.env` is gitignored; copy .env.example to create it.
+    # The explicit `environment:` block below overrides env_file for the two
+    # service-name networking values, which MUST differ from the host-oriented
+    # localhost defaults a copied .env carries.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Containers reach Mongo/MinIO by Compose service name, not localhost --
+      # these two are therefore set explicitly to the in-network address
+      # rather than inherited from a host-oriented .env (where
+      # WRC_MONGO_URI/WRC_MINIO_ENDPOINT default to localhost for processes
+      # run outside Docker). Everything else keeps following the project's
+      # normal WRC_* env-var configuration, so it stays consistent with
+      # whatever the mongo/minio services above were actually started with.
+      WRC_MONGO_URI: mongodb://mongo:27017
+      WRC_MONGO_DATABASE: ${WRC_MONGO_DATABASE:-wrc}
+      WRC_MONGO_COLLECTION: ${WRC_MONGO_COLLECTION:-landing_metadata}
+      WRC_MONGO_TRANSFORMED_COLLECTION: ${WRC_MONGO_TRANSFORMED_COLLECTION:-transformed_metadata}
+      WRC_MINIO_ENDPOINT: minio:9000
+      WRC_MINIO_ACCESS_KEY: ${WRC_MINIO_ACCESS_KEY:-minioadmin}
+      WRC_MINIO_SECRET_KEY: ${WRC_MINIO_SECRET_KEY:-minioadmin}
+      WRC_MINIO_BUCKET: ${WRC_MINIO_BUCKET:-wrc-landing}
+      WRC_MINIO_TRANSFORMED_BUCKET: ${WRC_MINIO_TRANSFORMED_BUCKET:-wrc-transformed}
+      WRC_MINIO_SECURE: ${WRC_MINIO_SECURE:-false}
+      # Dagster instance config (run_retries, run_coordinator concurrency).
+      DAGSTER_HOME: /app/.dagster_home
+    volumes:
+      # Named volume, not a host bind mount. Dagster's default instance storage
+      # is SQLite, whose POSIX file locking is unreliable over Docker Desktop's
+      # macOS bind-mount filesystem (VirtioFS/gRPC-FUSE) under the concurrent
+      # webserver+daemon+run-launcher writes a backfill triggers -- observed as
+      # transient "sqlite3.OperationalError: unable to open database file". A
+      # named volume lives in the Linux VM's own filesystem, so that lock path
+      # is bypassed. On first creation Docker seeds the empty volume from the
+      # image, which already contains .dagster_home/dagster.yaml (baked in via
+      # the Dockerfile, kept by .dockerignore), so run_retries/run_coordinator
+      # config still applies -- no host bind mount needed.
+      - wrc_dagster_home:/app/.dagster_home
+
 volumes:
   wrc_mongo_data:
   wrc_minio_data:
+  wrc_dagster_home:

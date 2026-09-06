@@ -1,0 +1,52 @@
+# Version control
+.git/
+.gitignore
+
+# Python build/runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments (platform-specific; the image builds its own)
+.venv/
+venv/
+.env/
+
+# Test/lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Dagster local instance state -- generated at runtime (run/schedule history,
+# logs). dagster.yaml is the one file the project actually tracks under here
+# (see .gitignore) and is kept in the image so `DAGSTER_HOME=/app/.dagster_home`
+# picks up its run_retries/run_coordinator config out of the box.
+.dagster_home/*
+!.dagster_home/dagster.yaml
+
+# Local environment files that may contain secrets/credentials -- configuration
+# comes from the runtime environment instead (see .env.example).
+.env
+.env.*
+
+# Logs
+*.log
+
+# Dev-only content not required by the running application.
+docs/
+scripts/
+tests/
+README.md
+ARCHITECTURE.md
+CLAUDE.md
+*.pdf
+
+# Editor/OS cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Docker-related files themselves don't need to be inside the image.
+Dockerfile
+docker-compose.yml
+.dockerignore
