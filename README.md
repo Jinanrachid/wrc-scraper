@@ -137,6 +137,13 @@ the Docker image.
 
 ## Local setup
 
+Clone the repo and move into it:
+
+```bash
+git clone https://github.com/Jinanrachid/wrc-scraper.git
+cd wrc-scraper
+```
+
 The project is managed with `uv`. A single sync installs the runtime
 dependencies, the Dagster orchestration group, and the lint/test tooling:
 
