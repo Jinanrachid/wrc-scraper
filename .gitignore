@@ -6,7 +6,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-uv.lock
+.dagster_home/*
+!.dagster_home/dagster.yaml
 *.log
 .env
 .env.*
@@ -15,3 +16,5 @@ scratch/
 /samples/
 CLAUDE.md
 Kedra SWE - LG_260901_212712.pdf
+scripts/
+docs/
