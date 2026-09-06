@@ -40,7 +40,7 @@ def test_defaults_when_no_env_vars_set(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.CONCURRENT_REQUESTS == 16
     assert settings.CONCURRENT_REQUESTS_PER_DOMAIN == 16
     assert settings.DOWNLOAD_DELAY == 0.0
-    assert settings.RETRY_TIMES == 3
+    assert settings.RETRY_TIMES == 5
     assert settings.DOWNLOAD_TIMEOUT == 60
     assert settings.ROBOTSTXT_OBEY is False
     # Reactor is pinned (not inherited from Scrapy's version-dependent default).
@@ -59,7 +59,7 @@ def test_twisted_reactor_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     [
         ("WRC_CONCURRENT_REQUESTS", "16", "CONCURRENT_REQUESTS", 16),
         ("WRC_DOWNLOAD_DELAY", "0.5", "DOWNLOAD_DELAY", 0.5),
-        ("WRC_RETRY_TIMES", "5", "RETRY_TIMES", 5),
+        ("WRC_RETRY_TIMES", "7", "RETRY_TIMES", 7),
         ("WRC_DOWNLOAD_TIMEOUT", "60", "DOWNLOAD_TIMEOUT", 60),
         ("WRC_ROBOTSTXT_OBEY", "true", "ROBOTSTXT_OBEY", True),
     ],
