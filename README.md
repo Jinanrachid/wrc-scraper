@@ -316,6 +316,57 @@ the form to use when materializing from the CLI:
   --select "landing_documents,processed_documents" --partition "wrc|2024-01-01"
 ```
 
+### Backfilling from inside the Docker container
+
+Running the full stack via `docker compose up -d` (see [Docker setup](#docker-setup))
+already bakes `DAGSTER_HOME` into the `app` image, so a backfill can be launched
+directly inside that container with `dagster job backfill`, using the same
+`body_slug|YYYY-MM-01` partition keys as above:
+
+```bash
+docker compose exec app dagster job backfill \
+  -m wrc_scraper.orchestration.definitions \
+  -j wrc_pipeline \
+  --partitions "wrc|2024-01-01" \
+  --noprompt
+```
+
+`wrc|2024-01-01` (the Workplace Relations Commission body, January 2024) is a
+verified non-empty partition — 234 records — so re-running this example against
+a fresh clone will produce visible output rather than an empty result.
+`docker compose exec app` is preferred over a raw `docker exec <container>`
+because it doesn't depend on the Compose project name (which defaults to the
+cloned directory name, e.g. `wrc-scraper-app-1`); use `-j landing` or
+`-j process` to backfill a single stage. `--partitions` also accepts a
+comma-separated list of multiple `body_slug|YYYY-MM-01` keys — needed for a
+multi-partition backfill since partitioning is two-dimensional (month × body),
+so the single-axis `--from`/`--to` flags don't apply.
+
+**Confirming a backfill succeeded** — the command only confirms the runs were
+*launched* (`Launched backfill job <id>`); check their actual outcome with:
+
+```bash
+docker compose exec app dagster run list --limit 5   # shows recent run IDs
+```
+
+or query the run status directly (`SUCCESS`/`FAILURE`) via the Dagster UI's
+**Runs** tab at http://localhost:3000/runs, or its GraphQL API:
+
+```bash
+curl -s http://localhost:3000/graphql -H 'Content-Type: application/json' -d \
+  '{"query":"{ runsOrError(limit:5) { ... on Runs { results { runId status jobName } } } }"}'
+```
+
+**Checking the results in mongo-express** — start it if not already running
+(`docker compose --profile tools up -d mongo-express`), then open
+http://localhost:8081 (login `WRC_MONGO_EXPRESS_USER`/`WRC_MONGO_EXPRESS_PASSWORD`,
+default `admin`/`admin`) and browse to the `WRC_MONGO_DATABASE` (default `wrc`) →
+`landing_metadata` (crawl output) or `transformed_metadata` (transform output)
+collection. Filter by the `body_slug` / `partition_date` fields to find the
+records a given backfill wrote; each document's `file_path` is the
+corresponding MinIO object key, browsable in the MinIO console at
+http://localhost:9001.
+
 ## Testing
 
 ```bash
