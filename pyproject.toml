@@ -34,3 +34,9 @@ pythonpath = ["."]
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "dagster>=1.13.21",
+    "dagster-webserver>=1.13.21",
+]

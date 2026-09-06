@@ -1,4 +1,4 @@
-"""Phase 4 transformation state machine.
+"""Transformation state machine.
 
 Mirrors `wrc_scraper.storage.ingest_service.IngestService`: framework-agnostic
 (depends only on the Protocols below, never on pymongo/minio directly), so it
@@ -18,16 +18,21 @@ identifier)` group found in the requested date range:
    entirely -- no download, no re-cleaning (`source_candidates` is the
    "reference" the assessment's idempotency requirement calls for).
 3. Otherwise fetch + clean (html) or fetch as-is (pdf/doc/docx) every candidate,
-   and pick the canonical one: longest cleaned/raw content wins, a detected
-   signature block is the secondary tiebreaker, `detail_url` breaks any
-   remaining tie deterministically. Near-ties are logged as ambiguous rather
-   than decided silently.
+   and pick the canonical one. Document-type precedence is applied first: a
+   non-empty HTML variant always wins over PDF/DOC/DOCX (an HTML variant that
+   resolved empty never does -- and never can, since `clean_html` already
+   drops empty/missing div.content before it reaches candidate selection).
+   Within the winning document type, longest cleaned/raw content wins, a
+   detected signature block is the secondary tiebreaker, and `detail_url`
+   breaks any remaining tie deterministically. HTML char counts and binary
+   byte sizes are never compared against each other. Near-ties (within the
+   winning type) are logged as ambiguous rather than decided silently.
 4. Write the canonical bytes to the transformed bucket under
    `{body_slug}/{sanitize_identifier(identifier)}.{ext}`, and the transformed
    metadata (new `file_path`, new `file_hash`, `source_file_hash` /
    `source_candidates` provenance) to the transformed collection. MinIO is
    written before Mongo is marked "stored" -- same ordering rule as
-   `IngestService` (Decision 8).
+   `IngestService`.
 
 Every candidate that is not the canonical copy is logged (`variant_dropped`)
 with its reason -- a fetch/clean failure or simply losing the selection.
@@ -64,7 +69,9 @@ _KNOWN_DOCUMENT_TYPES = frozenset(CONTENT_TYPES)
 
 
 class SourceMongoPort(Protocol):
-    def find_stored(self, start_date: str, end_date: str) -> list[dict]: ...
+    def find_stored(
+        self, start_date: str, end_date: str, *, body_slug: str | None = None
+    ) -> list[dict]: ...
     def find_stored_by_identifier(self, body_slug: str, identifier: str) -> list[dict]: ...
 
 
@@ -157,12 +164,24 @@ class TransformService:
         self._max_workers = max(1, max_workers)
         self._events_logger = events_logger or get_events_logger()
 
-    def transform_range(self, start_date: str, end_date: str) -> RunSummary:
-        landing_records = self._source_mongo.find_stored(start_date, end_date)
+    def transform_range(
+        self, start_date: str, end_date: str, *, body_slug: str | None = None
+    ) -> RunSummary:
+        """Transform every landing record in `[start_date, end_date]`.
+
+        `body_slug`, when given, scopes the run to one deciding body -- used
+        by the Dagster `processed_documents` asset, which is partitioned on
+        `(month, body_slug)` and must only read/write its own partition's
+        slice. Left `None` (the default) for standalone CLI use, which keeps
+        processing every body in the date range -- a wider scope, still
+        correct.
+        """
+        landing_records = self._source_mongo.find_stored(start_date, end_date, body_slug=body_slug)
         self._log(
             "transform_started",
             start_date=start_date,
             end_date=end_date,
+            body_slug=body_slug,
             landing_records_found=len(landing_records),
         )
 
@@ -303,19 +322,34 @@ class TransformService:
             self._log("record_failed", doc_id=doc_id, reason="no viable candidate in cluster")
             return "failed", 0
 
-        resolved.sort(
+        # Document-type precedence: a non-empty HTML variant always outranks
+        # PDF/DOC/DOCX (never the reverse), and an HTML variant that resolved
+        # empty never outranks a valid binary -- but `clean_html` already
+        # drops empty/missing div.content candidates before they reach
+        # `resolved` (see _resolve_candidates), so `text_length > 0` here is a
+        # defensive restatement of that guarantee, not new behavior. Within
+        # one document type, `text_length` is a comparable unit (chars for
+        # HTML, bytes for binary); across types it deliberately never is, so
+        # HTML and binary candidates are never sorted against each other.
+        html_variants = [
+            r
+            for r in resolved
+            if r.candidate["document_type"] == "html_inline" and r.text_length > 0
+        ]
+        selection_pool = html_variants or resolved
+        selection_pool.sort(
             key=lambda r: (-r.text_length, not r.has_signature_block, r.candidate["detail_url"])
         )
-        canonical = resolved[0]
+        canonical = selection_pool[0]
 
-        if len(resolved) > 1:
-            gap = resolved[0].text_length - resolved[1].text_length
+        if len(selection_pool) > 1:
+            gap = selection_pool[0].text_length - selection_pool[1].text_length
             if gap <= self._near_tie_chars:
                 self._log(
                     "variant_selection_ambiguous",
                     doc_id=doc_id,
-                    top=resolved[0].candidate["detail_url"],
-                    runner_up=resolved[1].candidate["detail_url"],
+                    top=selection_pool[0].candidate["detail_url"],
+                    runner_up=selection_pool[1].candidate["detail_url"],
                     text_length_gap=gap,
                 )
 
@@ -359,7 +393,7 @@ class TransformService:
                     "source_doc_id": canonical.candidate["_id"],
                 },
             )
-        except Exception as exc:  # noqa: BLE001 -- mirrors IngestService Decision 8:
+        except Exception as exc:  # noqa: BLE001 -- mirrors IngestService's ordering rule:
             # MinIO already succeeded; the object becomes a harmless, retryable
             # orphan rather than Mongo claiming a "stored" it can't confirm.
             self._log("record_failed", doc_id=doc_id, reason=repr(exc))

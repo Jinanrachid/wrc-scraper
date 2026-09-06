@@ -28,6 +28,8 @@ ADDONS = {}
 TWISTED_REACTOR = _cfg.twisted_reactor
 
 # Identify the crawler honestly (docs/SCRAPY_EXPERIMENTS.md robots.txt section).
+# Static, not rotated -- a deliberate decision, not an oversight; see
+# docs/SCRAPY_EXPERIMENTS.md Sec 24.
 USER_AGENT = _cfg.user_agent
 
 # robots.txt disallows the capitalized /en/Cases/ and *_Import/ folders, but the
@@ -45,8 +47,8 @@ CONCURRENT_REQUESTS = _cfg.concurrent_requests
 CONCURRENT_REQUESTS_PER_DOMAIN = _cfg.concurrent_requests_per_domain
 DOWNLOAD_DELAY = _cfg.download_delay
 
-# AutoThrottle as a runtime safety net, reconciled with the measured baseline
-# (hardening item 8): start delay and target concurrency default to the validated
+# AutoThrottle as a runtime safety net, reconciled with the measured baseline:
+# start delay and target concurrency default to the validated
 # ~0-delay / measured-concurrency behavior so healthy conditions reproduce the
 # baseline, while still adapting upward automatically under real latency
 # degradation. Target concurrency defaults to CONCURRENT_REQUESTS (not a fixed
@@ -73,11 +75,18 @@ TELNETCONSOLE_ENABLED = _cfg.telnetconsole_enabled
 
 LOG_LEVEL = _cfg.log_level
 
-# Records per-request latency (mean/p95) into the run's stats -- used by the
-# Step 2.0 experiments (docs/SCRAPY_EXPERIMENTS.md Sec 15) and kept on in
-# production since it's cheap and useful in the run summary.
+# ConditionalGetMiddleware: attaches If-None-Match to the chained binary
+# document request when a verified prior copy is already stored (WRC_*
+# Mongo/MinIO settings, WRC_CONDITIONAL_GET to disable). See
+# wrc_scraper/middlewares.py.
+#
+# LatencyStatsMiddleware: records per-request latency (mean/p95) into the
+# run's stats -- used by the Step 2.0 experiments
+# (docs/SCRAPY_EXPERIMENTS.md Sec 15) and kept on in production since it's
+# cheap and useful in the run summary.
 DOWNLOADER_MIDDLEWARES = {
-    "wrc_scraper.extensions.LatencyStatsMiddleware": 950,
+    "wrc_scraper.middlewares.ConditionalGetMiddleware": 750,
+    "wrc_scraper.middlewares.LatencyStatsMiddleware": 950,
 }
 
 # Writes every scraped item to MongoDB + MinIO via IngestService

@@ -1,4 +1,4 @@
-"""Thin Scrapy item pipeline adapter (Phase 3, Step 2.3 architecture).
+"""Thin Scrapy item pipeline adapter.
 
 Deliberately thin: all state-machine/idempotency logic lives in
 IngestService (framework-agnostic, independently unit-tested). This class's

@@ -1,4 +1,4 @@
-"""Deterministic identity for Phase 3 storage.
+"""Deterministic identity for Landing Zone storage.
 
 Identity is `(body_slug, detail_url)` -- never `(body, identifier)`, and never
 `partition_date`, so a record's identity is stable no matter which date window
@@ -36,7 +36,22 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
-_UNSAFE_SLUG_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+_UNSAFE_SLUG_CHARS = re.compile(r"[^A-Za-z0-9._~-]")
+
+# Characters with a dedicated, readable `~word~` token. Escaped one character
+# at a time over the *original* string (never by chaining `str.replace` calls
+# over a growing output) so the encoding is deterministic and collision-free:
+# each input character maps to exactly one output token/passthrough, and `~`
+# itself is tokenized too, so a literal `~` already in an identifier can never
+# be mistaken for the start of a token produced by this function.
+_UNSAFE_CHAR_TOKENS = {
+    "/": "slash",
+    "\\": "backslash",
+    "&": "and",
+    "?": "question",
+    ":": "colon",
+    "~": "tilde",
+}
 
 
 def detail_url_path(detail_url: str) -> str:
@@ -82,7 +97,7 @@ def minio_object_key(body_slug: str, detail_url: str, document_type: str) -> str
 
 
 def transformed_mongo_document_id(body_slug: str, identifier: str) -> str:
-    """`{body slug}:{sanitized identifier}` -- the Phase 4 transformed-store key.
+    """`{body slug}:{sanitized identifier}` -- the transformed-store key.
 
     Unlike the landing key (`mongo_document_id`, keyed on `detail_url`), the
     transformed store is keyed on `identifier`: several landing `detail_url`s can
@@ -103,21 +118,42 @@ def transformed_minio_object_key(body_slug: str, identifier: str, document_type:
     return f"{body_slug}/{sanitize_identifier(identifier)}.{_extension_for(document_type)}"
 
 
+def _encode_unsafe_chars(text: str) -> str:
+    """Token-encode every character in `_UNSAFE_CHAR_TOKENS`, one input
+    character at a time.
+
+    Collision-resistant by construction: `~` only ever appears in the output
+    as part of a `~word~` token (`~` itself is tokenized to `~tilde~`), and
+    every other passthrough character comes through unchanged -- so two
+    different inputs can never encode to the same output. E.g. `RP74/2007` ->
+    `RP74~slash~2007` (never collides with the literal `RP74-2007`), and
+    `A~B` -> `A~tilde~B` (never collides with literal text that already
+    contains `~slash~`, since that text's own `~`s get tokenized too).
+    """
+    return "".join(
+        f"~{_UNSAFE_CHAR_TOKENS[char]}~" if char in _UNSAFE_CHAR_TOKENS else char for char in text
+    )
+
+
 def sanitize_identifier(identifier: str) -> str:
-    """Filename-safe form of `identifier` (h2.title), for the transformation
-    stage's `identifier.ext` renaming.
+    """Filename-safe, collision-resistant form of `identifier` (h2.title),
+    for the transformation stage's `identifier.ext` renaming and destination
+    document id.
 
     Handles all unsafe patterns observed in live data across all four bodies:
-    - `/`             RP74/2007 -- replaced with `-`
+    - `/ \\ & ? : ~`  token-encoded via `_UNSAFE_CHAR_TOKENS` (e.g.
+                      `RP74/2007` -> `RP74~slash~2007`) rather than replaced
+                      with a lossy separator -- two identifiers differing only
+                      by one of these characters must never collide on the
+                      same storage key.
     - `,`             compound multi-complaint titles -- stripped
-    - `&`             compound case titles (ADJ-00045266 & ADJ-00047456) -- stripped
     - en-dash `–`     variant of ` - ` used in IR-SC identifiers -- normalised to `-`
     - spaces          replaced with `_`, then consecutive separators collapsed
     - any other char  raises -- this sanitizes what we have evidence for; it is
                       not a blanket "make any string safe" helper.
 
-    Not used for identity -- `identifier` is not part of the key, and this
-    slug collides wherever the raw identifier collides, which is expected.
+    This is the *storage-name* encoding only: it never touches the original
+    `identifier` value stored in MongoDB, which callers keep verbatim.
     """
     if not identifier or not identifier.strip():
         raise ValueError("identifier must not be empty")
@@ -125,7 +161,8 @@ def sanitize_identifier(identifier: str) -> str:
     slug = identifier.strip()
     # Normalise unicode dashes/hyphens to ASCII hyphen before further processing
     slug = slug.replace("\u2013", "-").replace("\u2014", "-")  # en-dash, em-dash
-    slug = slug.replace("/", "-").replace(",", "").replace("&", "")
+    slug = _encode_unsafe_chars(slug)
+    slug = slug.replace(",", "")
     slug = re.sub(r"\s+", "_", slug)
     slug = re.sub(r"[-_]{2,}", lambda match: match.group(0)[0], slug)
     slug = slug.strip("-_")  # remove leading/trailing separators left by stripping chars

@@ -1,0 +1,26 @@
+# Dagster instance config. Tracked in git (unlike the rest of `.dagster_home/`,
+# which is generated run/schedule/log state -- see .gitignore); loaded whenever
+# DAGSTER_HOME points here (see README "Running the orchestration").
+#
+# Enables the daemon's run-level retry layer (ARCHITECTURE.md "Retry /
+# rate-limiting strategy" layer 3: "Run (Dagster's daemon run_retries) --
+# relaunches a run that crashed outright"), on top of -- not instead of -- the
+# partition-level RetryPolicy (layer 2, WRC_ORCHESTRATION_RETRY_MAX/
+# _DELAY_SECONDS) already configured on both assets. Requires `dagster-daemon`
+# to actually be running, which `dagster dev` starts automatically.
+run_retries:
+  enabled: true
+  max_retries: 3
+
+# Caps concurrent partition runs (each spawns its own `scrapy crawl`
+# subprocess with its own WRC_CONCURRENT_REQUESTS pool -- the two limits
+# multiply, not cap each other). 4 concurrent runs x the default
+# WRC_CONCURRENT_REQUESTS=16 per subprocess keeps total concurrent load
+# against WRC in the same ballpark as the single-process tuning in
+# docs/SCRAPY_EXPERIMENTS.md Sec 21, instead of the framework default
+# (8) driving up to 128 concurrent requests during a backfill.
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 4

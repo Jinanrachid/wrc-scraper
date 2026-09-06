@@ -18,6 +18,9 @@ class FakeMongoRepository:
         self.mark_failed_calls = 0
         self.fail_on_mark_stored = False
 
+    def ensure_indexes(self) -> None:
+        pass
+
     def get(self, doc_id: str) -> dict | None:
         doc = self.docs.get(doc_id)
         return dict(doc) if doc is not None else None
@@ -29,12 +32,15 @@ class FakeMongoRepository:
             if doc.get("body_slug") == body_slug and doc.get("identifier") == identifier
         )
 
-    def find_stored(self, start_date: str, end_date: str) -> list[dict]:
+    def find_stored(
+        self, start_date: str, end_date: str, *, body_slug: str | None = None
+    ) -> list[dict]:
         matches = [
             doc
             for doc in self.docs.values()
             if doc.get("status") == "stored"
             and start_date <= doc.get("partition_date", "") <= end_date
+            and (body_slug is None or doc.get("body_slug") == body_slug)
         ]
         # `.get(..., "")` mirrors real MongoDB's tolerant sort (a missing field
         # sorts as if absent, it never raises) -- a landing record can be
@@ -143,6 +149,9 @@ class FakeMinioRepository:
         self.objects: dict[str, bytes] = {}
         self.put_calls = 0
         self.fail_on_put = False
+
+    def ensure_bucket(self) -> None:
+        pass
 
     def object_exists(self, key: str) -> bool:
         return key in self.objects

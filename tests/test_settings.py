@@ -44,9 +44,7 @@ def test_defaults_when_no_env_vars_set(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.DOWNLOAD_TIMEOUT == 60
     assert settings.ROBOTSTXT_OBEY is False
     # Reactor is pinned (not inherited from Scrapy's version-dependent default).
-    assert settings.TWISTED_REACTOR == (
-        "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
-    )
+    assert settings.TWISTED_REACTOR == ("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
 
 
 def test_twisted_reactor_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
