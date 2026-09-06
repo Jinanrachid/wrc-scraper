@@ -200,7 +200,7 @@ class ScrapingSettings:
                 "WRC_AUTOTHROTTLE_TARGET_CONCURRENCY", float(concurrent_requests)
             ),
             retry_enabled=env_bool("WRC_RETRY_ENABLED", True),
-            retry_times=env_int("WRC_RETRY_TIMES", 3),
+            retry_times=env_int("WRC_RETRY_TIMES", 5),
             retry_http_codes=env_int_list("WRC_RETRY_HTTP_CODES", DEFAULT_RETRY_HTTP_CODES),
             download_timeout=env_int("WRC_DOWNLOAD_TIMEOUT", 60),
             download_maxsize=env_int("WRC_DOWNLOAD_MAXSIZE", 50 * 1024 * 1024),

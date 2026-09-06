@@ -35,7 +35,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
-    PATH="/app/.venv/bin:${PATH}"
+    PATH="/app/.venv/bin:${PATH}" \
+    # Default for the env-substituted max_concurrent_runs in
+    # .dagster_home/dagster.yaml. Dagster's env substitution has no inline YAML
+    # default, so bake the committed default here; docker-compose.yml and .env
+    # override it. This keeps `docker run ...` (without Compose/.env) working.
+    WRC_DAGSTER_MAX_CONCURRENT_RUNS=4
 
 WORKDIR /app
 

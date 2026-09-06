@@ -121,6 +121,10 @@ services:
       WRC_MINIO_SECURE: ${WRC_MINIO_SECURE:-false}
       # Dagster instance config (run_retries, run_coordinator concurrency).
       DAGSTER_HOME: /app/.dagster_home
+      # Max concurrent partition runs during a backfill (QueuedRunCoordinator in
+      # .dagster_home/dagster.yaml). Env-driven with a built-in default of 4, so
+      # an absent .env behaves like the committed default.
+      WRC_DAGSTER_MAX_CONCURRENT_RUNS: ${WRC_DAGSTER_MAX_CONCURRENT_RUNS:-4}
     volumes:
       # Named volume, not a host bind mount. Dagster's default instance storage
       # is SQLite, whose POSIX file locking is unreliable over Docker Desktop's

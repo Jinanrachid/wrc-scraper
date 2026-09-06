@@ -14,13 +14,22 @@ run_retries:
 
 # Caps concurrent partition runs (each spawns its own `scrapy crawl`
 # subprocess with its own WRC_CONCURRENT_REQUESTS pool -- the two limits
-# multiply, not cap each other). 4 concurrent runs x the default
-# WRC_CONCURRENT_REQUESTS=16 per subprocess keeps total concurrent load
-# against WRC in the same ballpark as the single-process tuning in
+# multiply, not cap each other). The default of 4 concurrent runs x the
+# default WRC_CONCURRENT_REQUESTS=16 per subprocess keeps total concurrent
+# load against WRC in the same ballpark as the single-process tuning in
 # docs/SCRAPY_EXPERIMENTS.md Sec 21, instead of the framework default
 # (8) driving up to 128 concurrent requests during a backfill.
+#
+# Env-driven (no hardcoded value) via WRC_DAGSTER_MAX_CONCURRENT_RUNS, to match
+# the rest of the WRC_* config contract (.env.example). Dagster's env
+# substitution has no inline YAML default, so the default (4) is supplied by the
+# environment instead: docker-compose.yml sets it with `${...:-4}` and the
+# Dockerfile bakes an ENV fallback, so an absent .env still behaves like the
+# committed default. For a host `dagster dev` run, export it first (e.g.
+# `set -a; source .env; set +a`) as the README instructs.
 run_coordinator:
   module: dagster.core.run_coordinator
   class: QueuedRunCoordinator
   config:
-    max_concurrent_runs: 4
+    max_concurrent_runs:
+      env: WRC_DAGSTER_MAX_CONCURRENT_RUNS
